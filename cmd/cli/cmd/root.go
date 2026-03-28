@@ -13,8 +13,9 @@ import (
 var cfgFile string
 
 var rootCmd = &cobra.Command{
-	Use:   "funnel",
-	Short: "Download torrents directly to S3 / local storage",
+	Use:     "funnel",
+	Short:   "Download torrents directly to S3 / local storage",
+	Version: Version,
 }
 
 // Execute runs the root command.
@@ -58,6 +59,7 @@ func initConfig() {
 	viper.SetDefault("storage.s3.region", "us-east-1")
 	viper.SetDefault("storage.s3.base-dir", "./downloads")
 	viper.SetDefault("upload-rate", 524288)
+	viper.SetDefault("max-active", 3)
 
 	_ = viper.ReadInConfig()
 }

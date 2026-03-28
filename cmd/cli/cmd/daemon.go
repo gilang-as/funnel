@@ -7,6 +7,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"syscall"
 
 	"github.com/spf13/cobra"
@@ -25,6 +26,8 @@ var daemonCmd = &cobra.Command{
 
 func init() {
 	rootCmd.AddCommand(daemonCmd)
+	daemonCmd.Flags().Int("max-active", 0, "max concurrent downloads (default 3)")
+	_ = viper.BindPFlag("max-active", daemonCmd.Flags().Lookup("max-active"))
 }
 
 func runDaemon(cmd *cobra.Command, args []string) error {
@@ -46,7 +49,8 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 	}
 
 	uploadRate := int64(viper.GetInt("upload-rate"))
-	mgr, err := daemon.NewManager(stor, uploadRate, st)
+	maxActive := viper.GetInt("max-active")
+	mgr, err := daemon.NewManager(stor, uploadRate, maxActive, st, buildStorageInfo())
 	if err != nil {
 		return err
 	}
@@ -64,6 +68,26 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 	case err := <-errCh:
 		return err
 	}
+}
+
+func buildStorageInfo() daemon.StorageInfo {
+	storType := viper.GetString("storage.type")
+	if storType == "s3" {
+		endpoint := strings.TrimRight(viper.GetString("storage.s3.endpoint"), "/")
+		bucket := viper.GetString("storage.s3.bucket")
+		baseDir := strings.Trim(viper.GetString("storage.s3.base-dir"), "/")
+		loc := endpoint + "/" + bucket
+		if baseDir != "" && baseDir != "." {
+			loc += "/" + baseDir
+		}
+		return daemon.StorageInfo{Type: "s3", Location: loc}
+	}
+	dir := viper.GetString("storage.local.dir")
+	if len(dir) > 1 && dir[:2] == "~/" {
+		home, _ := os.UserHomeDir()
+		dir = filepath.Join(home, dir[2:])
+	}
+	return daemon.StorageInfo{Type: "local", Location: dir}
 }
 
 func buildStorage() (storage.ClientImpl, error) {

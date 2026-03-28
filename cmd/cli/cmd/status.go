@@ -38,6 +38,7 @@ func runStatus(cmd *cobra.Command, args []string) error {
 	}
 
 	fmt.Println("daemon: running")
+	fmt.Printf("storage: %-6s %s\n", st.Storage.Type, st.Storage.Location)
 	order := []daemon.Status{
 		daemon.StatusDownloading,
 		daemon.StatusSeeding,

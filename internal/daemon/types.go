@@ -11,10 +11,17 @@ const (
 	StatusFailed      Status = "failed"
 )
 
+// StorageInfo describes the active storage backend.
+type StorageInfo struct {
+	Type     string `json:"type"`     // "local" or "s3"
+	Location string `json:"location"` // path (local) or endpoint/bucket (s3)
+}
+
 // DaemonStatus holds aggregate counts per status.
 type DaemonStatus struct {
 	Running bool           `json:"running"`
 	Counts  map[Status]int `json:"counts"`
+	Storage StorageInfo    `json:"storage"`
 }
 
 // TorrentInfo is the public representation of a managed torrent.

@@ -833,19 +833,19 @@ func TestFinalizeMultipart_DeletesStateKey(t *testing.T) {
 		piece.MarkComplete()
 	}
 
-	// Tunggu semua chunk selesai.
+	// Tunggu state key terhapus — ini membuktikan finalizeMultipart selesai,
+	// bukan hanya partETags penuh (yang terjadi sebelum finalizeMultipart dipanggil).
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
-		state.activeMu.Lock()
-		done := len(state.partETags) == len(state.chunks)
-		state.activeMu.Unlock()
-		if done {
+		mock.mu.Lock()
+		_, exists := mock.objects[state.stateKey()]
+		mock.mu.Unlock()
+		if !exists {
 			break
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
 
-	// State JSON harus sudah terhapus.
 	mock.mu.Lock()
 	_, exists := mock.objects[state.stateKey()]
 	mock.mu.Unlock()

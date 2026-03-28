@@ -9,9 +9,20 @@ import (
 	"github.com/gilang/funnel/internal/ipc"
 )
 
+// managerIface is the subset of Manager used by the HTTP server.
+type managerIface interface {
+	Add(magnet string) (AddResponse, error)
+	List(filter Status) []TorrentInfo
+	Pause(id string) error
+	Resume(id string) error
+	Stop(id string) error
+	Remove(id string) error
+	DaemonStatus() DaemonStatus
+}
+
 // Server wraps the HTTP daemon.
 type Server struct {
-	mgr    *Manager
+	mgr    managerIface
 	cancel context.CancelFunc
 	srv    *http.Server
 }

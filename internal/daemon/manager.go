@@ -27,17 +27,18 @@ type managedTorrent struct {
 
 // Manager owns the anacrolix torrent client and tracks active torrents.
 type Manager struct {
-	client    *torrent.Client
-	torrents  map[string]*managedTorrent
-	mu        sync.RWMutex
-	state     *State
-	stor      storage.ClientImpl
-	maxActive int
+	client      *torrent.Client
+	torrents    map[string]*managedTorrent
+	mu          sync.RWMutex
+	state       *State
+	stor        storage.ClientImpl
+	maxActive   int
+	storageInfo StorageInfo
 }
 
-// NewManager creates a Manager with the given storage backend and upload rate
-// limit (bytes/sec; 0 = unlimited).
-func NewManager(stor storage.ClientImpl, uploadRate int64, st *State) (*Manager, error) {
+// NewManager creates a Manager with the given storage backend, upload rate
+// limit (bytes/sec; 0 = unlimited), and max concurrent downloads (0 = default 3).
+func NewManager(stor storage.ClientImpl, uploadRate int64, maxActive int, st *State, si StorageInfo) (*Manager, error) {
 	cfg := torrent.NewDefaultClientConfig()
 	cfg.DefaultStorage = stor
 	if uploadRate > 0 {
@@ -47,12 +48,16 @@ func NewManager(stor storage.ClientImpl, uploadRate int64, st *State) (*Manager,
 	if err != nil {
 		return nil, fmt.Errorf("torrent client: %w", err)
 	}
+	if maxActive <= 0 {
+		maxActive = 3
+	}
 	m := &Manager{
-		client:    client,
-		torrents:  make(map[string]*managedTorrent),
-		state:     st,
-		stor:      stor,
-		maxActive: 3,
+		client:      client,
+		torrents:    make(map[string]*managedTorrent),
+		state:       st,
+		stor:        stor,
+		maxActive:   maxActive,
+		storageInfo: si,
 	}
 	// Re-add torrents from persisted state.
 	for _, saved := range st.List() {
@@ -70,6 +75,30 @@ func NewManager(stor storage.ClientImpl, uploadRate int64, st *State) (*Manager,
 // Close shuts down the underlying torrent client.
 func (m *Manager) Close() {
 	m.client.Close()
+}
+
+// resolveID resolves a full or prefix ID to the full infoHash.
+// Returns an error if not found or ambiguous.
+func (m *Manager) resolveID(id string) (string, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if _, ok := m.torrents[id]; ok {
+		return id, nil
+	}
+	var matches []string
+	for k := range m.torrents {
+		if len(k) >= len(id) && k[:len(id)] == id {
+			matches = append(matches, k)
+		}
+	}
+	switch len(matches) {
+	case 0:
+		return "", fmt.Errorf("torrent %s not found", id)
+	case 1:
+		return matches[0], nil
+	default:
+		return "", fmt.Errorf("ambiguous id %q matches %d torrents", id, len(matches))
+	}
 }
 
 // Add adds a magnet link, deduplicating by infoHash.
@@ -130,6 +159,11 @@ func (m *Manager) addMagnet(magnet string, persist bool, initialStatus Status) e
 
 // Pause pauses a torrent (downloading or seeding).
 func (m *Manager) Pause(id string) error {
+	full, err := m.resolveID(id)
+	if err != nil {
+		return err
+	}
+	id = full
 	m.mu.RLock()
 	mt, ok := m.torrents[id]
 	m.mu.RUnlock()
@@ -162,6 +196,11 @@ func (m *Manager) Pause(id string) error {
 
 // Resume resumes a paused torrent.
 func (m *Manager) Resume(id string) error {
+	full, err := m.resolveID(id)
+	if err != nil {
+		return err
+	}
+	id = full
 	m.mu.RLock()
 	mt, ok := m.torrents[id]
 	m.mu.RUnlock()
@@ -192,8 +231,14 @@ func (m *Manager) Resume(id string) error {
 	return nil
 }
 
-// Stop removes a seeding torrent from the active list; data is retained.
+// Stop disconnects a torrent from the client and removes it from the active
+// list. Data is retained. Works from any state.
 func (m *Manager) Stop(id string) error {
+	full, err := m.resolveID(id)
+	if err != nil {
+		return err
+	}
+	id = full
 	m.mu.Lock()
 	mt, ok := m.torrents[id]
 	if ok {
@@ -204,18 +249,6 @@ func (m *Manager) Stop(id string) error {
 		return fmt.Errorf("torrent %s not found", id)
 	}
 
-	mt.mu.Lock()
-	st := mt.status
-	mt.mu.Unlock()
-
-	if st != StatusSeeding {
-		// Put back — wrong state.
-		m.mu.Lock()
-		m.torrents[id] = mt
-		m.mu.Unlock()
-		return fmt.Errorf("torrent %s is not seeding (status: %s)", id, st)
-	}
-
 	mt.t.Drop()
 	m.processQueue()
 	return m.state.Remove(id)
@@ -223,6 +256,11 @@ func (m *Manager) Stop(id string) error {
 
 // Remove removes a torrent from the active list and deletes its data.
 func (m *Manager) Remove(id string) error {
+	full, err := m.resolveID(id)
+	if err != nil {
+		return err
+	}
+	id = full
 	m.mu.Lock()
 	mt, ok := m.torrents[id]
 	if ok {
@@ -300,7 +338,7 @@ func (m *Manager) DaemonStatus() DaemonStatus {
 		counts[mt.status]++
 		mt.mu.Unlock()
 	}
-	return DaemonStatus{Running: true, Counts: counts}
+	return DaemonStatus{Running: true, Counts: counts, Storage: m.storageInfo}
 }
 
 // countActive returns the number of torrents actively downloading.

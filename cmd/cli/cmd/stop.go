@@ -12,7 +12,7 @@ import (
 
 var stopCmd = &cobra.Command{
 	Use:   "stop <id>",
-	Short: "Stop seeding a torrent (data retained)",
+	Short: "Disconnect a torrent from the client (data retained)",
 	Args:  cobra.ExactArgs(1),
 	RunE:  runStop,
 }
@@ -32,7 +32,7 @@ func runStop(cmd *cobra.Command, args []string) error {
 	defer resp.Body.Close()
 
 	if resp.StatusCode == http.StatusNoContent {
-		fmt.Printf("Stopped seeding: %s (data retained)\n", id)
+		fmt.Printf("Stopped: %s (data retained)\n", id)
 		return nil
 	}
 
