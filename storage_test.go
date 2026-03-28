@@ -463,9 +463,9 @@ func TestSyncFromS3_SkipsMultipartKeys(t *testing.T) {
 
 func TestDoUpload_RetriesOnTransientFailure(t *testing.T) {
 	// Percepat retry untuk test.
-	orig := retryDelay
-	retryDelay = func(_ int) time.Duration { return time.Millisecond }
-	defer func() { retryDelay = orig }()
+	orig := retryDelay.Load()
+	retryDelay.Store(func(_ int) time.Duration { return time.Millisecond })
+	defer func() { retryDelay.Store(orig) }()
 
 	mock := newMockS3()
 	// Gagalkan 2 call pertama; berhasil di call ke-3.
@@ -511,9 +511,9 @@ func TestDoUpload_RetriesOnTransientFailure(t *testing.T) {
 }
 
 func TestDoUpload_FailsAfterMaxRetries(t *testing.T) {
-	orig := retryDelay
-	retryDelay = func(_ int) time.Duration { return time.Millisecond }
-	defer func() { retryDelay = orig }()
+	orig := retryDelay.Load()
+	retryDelay.Store(func(_ int) time.Duration { return time.Millisecond })
+	defer func() { retryDelay.Store(orig) }()
 
 	mock := newMockS3()
 	// Selalu gagal.
@@ -749,9 +749,9 @@ func TestReadAbsolute_FallbackToS3(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestDoUpload_RecoversMissingUploadID(t *testing.T) {
-	orig := retryDelay
-	retryDelay = func(_ int) time.Duration { return time.Millisecond }
-	defer func() { retryDelay = orig }()
+	orig := retryDelay.Load()
+	retryDelay.Store(func(_ int) time.Duration { return time.Millisecond })
+	defer func() { retryDelay.Store(orig) }()
 
 	mock := newMockS3()
 	s := newTestStorage(t, mock)
@@ -803,9 +803,9 @@ func TestDoUpload_RecoversMissingUploadID(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestFinalizeMultipart_DeletesStateKey(t *testing.T) {
-	orig := retryDelay
-	retryDelay = func(_ int) time.Duration { return time.Millisecond }
-	defer func() { retryDelay = orig }()
+	orig := retryDelay.Load()
+	retryDelay.Store(func(_ int) time.Duration { return time.Millisecond })
+	defer func() { retryDelay.Store(orig) }()
 
 	mock := newMockS3()
 	s := newTestStorage(t, mock)
@@ -859,9 +859,9 @@ func TestFinalizeMultipart_DeletesStateKey(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestWriteAndUpload_SingleFile(t *testing.T) {
-	orig := retryDelay
-	retryDelay = func(_ int) time.Duration { return time.Millisecond }
-	defer func() { retryDelay = orig }()
+	orig := retryDelay.Load()
+	retryDelay.Store(func(_ int) time.Duration { return time.Millisecond })
+	defer func() { retryDelay.Store(orig) }()
 
 	mock := newMockS3()
 	s := newTestStorage(t, mock)

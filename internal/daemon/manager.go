@@ -30,7 +30,7 @@ type Manager struct {
 	client      *torrent.Client
 	torrents    map[string]*managedTorrent
 	mu          sync.RWMutex
-	state       *State
+	state       StateStore
 	stor        storage.ClientImpl
 	maxActive   int
 	storageInfo StorageInfo
@@ -38,7 +38,7 @@ type Manager struct {
 
 // NewManager creates a Manager with the given storage backend, upload rate
 // limit (bytes/sec; 0 = unlimited), and max concurrent downloads (0 = default 3).
-func NewManager(stor storage.ClientImpl, uploadRate int64, maxActive int, st *State, si StorageInfo) (*Manager, error) {
+func NewManager(stor storage.ClientImpl, uploadRate int64, maxActive int, st StateStore, si StorageInfo) (*Manager, error) {
 	cfg := torrent.NewDefaultClientConfig()
 	cfg.DefaultStorage = stor
 	if uploadRate > 0 {

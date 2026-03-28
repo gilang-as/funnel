@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/anacrolix/torrent/metainfo"
@@ -19,8 +20,13 @@ import (
 )
 
 // retryDelay menentukan jeda antar retry upload. Bisa di-override di tests.
-var retryDelay = func(attempt int) time.Duration {
-	return time.Duration(attempt+1) * 2 * time.Second
+// Menggunakan atomic.Value agar aman di-swap secara concurrent (race-free).
+var retryDelay atomic.Value
+
+func init() {
+	retryDelay.Store(func(attempt int) time.Duration {
+		return time.Duration(attempt+1) * 2 * time.Second
+	})
 }
 
 // s3FileState mengelola satu file: multipart upload ke S3 dan chunk lokal.
@@ -337,7 +343,7 @@ func (c *s3Chunk) doUpload() {
 		log.Printf("[RETRY %d/%d] %s | Chunk %d: %v\n",
 			attempt+1, maxUploadRetries, c.state.relPath, c.index+1, err)
 		if attempt < maxUploadRetries-1 {
-			time.Sleep(retryDelay(attempt))
+			time.Sleep(retryDelay.Load().(func(int) time.Duration)(attempt))
 		}
 	}
 

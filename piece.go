@@ -57,7 +57,7 @@ func (pc *s3PieceCompletion) uploadMarker(index int) {
 		}
 		log.Printf("[WARN] uploadMarker piece %d attempt %d/%d: %v\n", index, attempt+1, maxUploadRetries, err)
 		if attempt < maxUploadRetries-1 {
-			time.Sleep(retryDelay(attempt))
+			time.Sleep(retryDelay.Load().(func(int) time.Duration)(attempt))
 		}
 	}
 }

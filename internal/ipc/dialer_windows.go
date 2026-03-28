@@ -4,6 +4,7 @@ package ipc
 
 import (
 	"context"
+	"net"
 	"net/http"
 
 	"github.com/Microsoft/go-winio"

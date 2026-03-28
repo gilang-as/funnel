@@ -7,6 +7,8 @@ import (
 	"sync"
 )
 
+var _ StateStore = (*State)(nil)
+
 // SavedTorrent is a torrent entry persisted to disk so the daemon can
 // resume it after restart.
 type SavedTorrent struct {
