@@ -52,6 +52,9 @@ func (r *mysqlTokenRepo) List(ctx context.Context) ([]JoinToken, error) {
 		}
 		tokens = append(tokens, t)
 	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
 	return tokens, nil
 }
 

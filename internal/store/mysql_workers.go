@@ -59,6 +59,9 @@ func (r *mysqlWorkerRepo) List(ctx context.Context) ([]WorkerInfo, error) {
 		}
 		workers = append(workers, w)
 	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
 	return workers, nil
 }
 
@@ -101,6 +104,9 @@ func (r *mysqlWorkerRepo) StaleIDs(ctx context.Context, threshold time.Duration)
 			return nil, err
 		}
 		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
 	}
 	return ids, nil
 }

@@ -96,3 +96,6 @@ func (s *State) List() []SavedTorrent {
 	copy(out, s.Torrents)
 	return out
 }
+
+// Close is a no-op for the file-based state store; satisfies StateStore.
+func (s *State) Close() error { return nil }

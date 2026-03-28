@@ -112,6 +112,9 @@ func (r *mysqlJobRepo) List(ctx context.Context, filter JobFilter) ([]Job, error
 		}
 		jobs = append(jobs, job)
 	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
 	return jobs, nil
 }
 

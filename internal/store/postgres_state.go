@@ -3,6 +3,7 @@ package store
 import (
 	"database/sql"
 	"fmt"
+	"log"
 
 	sq "github.com/Masterminds/squirrel"
 	"gopkg.gilang.dev/funnel/internal/daemon"
@@ -45,8 +46,14 @@ func (s *pgStateStore) List() []daemon.SavedTorrent {
 		}
 		torrents = append(torrents, t)
 	}
+	if err := rows.Err(); err != nil {
+		log.Printf("[state] list error: %v", err)
+		return nil
+	}
 	return torrents
 }
+
+func (s *pgStateStore) Close() error { return s.db.Close() }
 
 func (s *pgStateStore) Add(t daemon.SavedTorrent) error {
 	_, err := pgBuilder.Insert("state_torrents").

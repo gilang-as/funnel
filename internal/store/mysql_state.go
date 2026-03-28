@@ -3,6 +3,7 @@ package store
 import (
 	"database/sql"
 	"fmt"
+	"log"
 
 	sq "github.com/Masterminds/squirrel"
 	"gopkg.gilang.dev/funnel/internal/daemon"
@@ -45,8 +46,14 @@ func (s *mysqlStateStore) List() []daemon.SavedTorrent {
 		}
 		torrents = append(torrents, t)
 	}
+	if err := rows.Err(); err != nil {
+		log.Printf("[state] list error: %v", err)
+		return nil
+	}
 	return torrents
 }
+
+func (s *mysqlStateStore) Close() error { return s.db.Close() }
 
 func (s *mysqlStateStore) Add(t daemon.SavedTorrent) error {
 	_, err := mysqlBuilder.Insert("state_torrents").

@@ -10,6 +10,7 @@ import (
 	"os/signal"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/spf13/cobra"
@@ -84,16 +85,24 @@ func runServe(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("listen tcp: %w", err)
 	}
 
+	httpSrv := &http.Server{Handler: mux}
+
 	errCh := make(chan error, 1)
 	go func() {
 		log.Printf("[manager] listening on %s", ln.Addr())
-		errCh <- http.Serve(ln, mux)
+		if err := httpSrv.Serve(ln); err != nil && err != http.ErrServerClosed {
+			errCh <- err
+		} else {
+			errCh <- nil
+		}
 	}()
 
 	select {
 	case <-sigCtx.Done():
 		log.Println("[manager] shutting down...")
-		return nil // http.Server doesn't expose easy Shutdown here without wrapping
+		shutCtx, shutCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer shutCancel()
+		return httpSrv.Shutdown(shutCtx)
 	case err := <-errCh:
 		return err
 	}
@@ -123,23 +132,30 @@ type dbManager struct {
 	store store.Store
 }
 
+// dbCtx returns a context with a 10-second timeout for database operations.
+func dbCtx() (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.Background(), 10*time.Second)
+}
+
 func (m *dbManager) Add(magnet string) (daemon.AddResponse, error) {
-	// Simple info hash extraction or just use a placeholder until worker gets info
-	// For now we use a random ID and update it when worker reports progress
+	ctx, cancel := dbCtx()
+	defer cancel()
 	id := uuid.New().String()
 	job := &store.Job{
 		ID:     id,
 		Magnet: magnet,
 		Status: store.JobQueued,
 	}
-	if err := m.store.Jobs().Create(context.Background(), job); err != nil {
+	if err := m.store.Jobs().Create(ctx, job); err != nil {
 		return daemon.AddResponse{}, err
 	}
 	return daemon.AddResponse{ID: id, Status: daemon.StatusQueued, New: true}, nil
 }
 
 func (m *dbManager) List(filter daemon.Status) []daemon.TorrentInfo {
-	jobs, err := m.store.Jobs().List(context.Background(), store.JobFilter{
+	ctx, cancel := dbCtx()
+	defer cancel()
+	jobs, err := m.store.Jobs().List(ctx, store.JobFilter{
 		Status: store.JobStatus(filter),
 	})
 	if err != nil {
@@ -160,37 +176,48 @@ func (m *dbManager) List(filter daemon.Status) []daemon.TorrentInfo {
 }
 
 func (m *dbManager) Pause(id string) error {
-	return m.store.Jobs().Update(context.Background(), id, func(j *store.Job) {
+	ctx, cancel := dbCtx()
+	defer cancel()
+	return m.store.Jobs().Update(ctx, id, func(j *store.Job) {
 		j.Paused = true
 		j.Status = store.JobPaused
 	})
 }
 
 func (m *dbManager) Resume(id string) error {
-	return m.store.Jobs().Update(context.Background(), id, func(j *store.Job) {
+	ctx, cancel := dbCtx()
+	defer cancel()
+	return m.store.Jobs().Update(ctx, id, func(j *store.Job) {
 		j.Paused = false
 		j.Status = store.JobQueued
 	})
 }
 
 func (m *dbManager) Stop(id string) error {
-	// Stop in manager means moving to a finished state or just deleting from active workers
-	return m.store.Jobs().Update(context.Background(), id, func(j *store.Job) {
-		j.Status = store.JobPaused // or a new 'Stopped' state
+	ctx, cancel := dbCtx()
+	defer cancel()
+	return m.store.Jobs().Update(ctx, id, func(j *store.Job) {
+		j.Status = store.JobPaused
 	})
 }
 
 func (m *dbManager) Remove(id string) error {
-	return m.store.Jobs().Delete(context.Background(), id)
+	ctx, cancel := dbCtx()
+	defer cancel()
+	return m.store.Jobs().Delete(ctx, id)
 }
 
 func (m *dbManager) DaemonStatus() daemon.DaemonStatus {
-	jobs, _ := m.store.Jobs().List(context.Background(), store.JobFilter{})
+	ctx, cancel := dbCtx()
+	defer cancel()
+	jobs, _ := m.store.Jobs().List(ctx, store.JobFilter{})
 	counts := make(map[daemon.Status]int)
 	for _, j := range jobs {
 		counts[daemon.Status(j.Status)]++
 	}
-	workers, _ := m.store.Workers().List(context.Background())
+	ctx2, cancel2 := dbCtx()
+	defer cancel2()
+	workers, _ := m.store.Workers().List(ctx2)
 	activeWorkers := 0
 	for _, w := range workers {
 		if w.Status == "active" {

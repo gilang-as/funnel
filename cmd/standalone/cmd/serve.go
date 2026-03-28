@@ -48,6 +48,7 @@ func runServe(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
+	defer st.Close()
 
 	uploadRate := int64(viper.GetInt("upload-rate"))
 	maxActive := viper.GetInt("max-active")

@@ -64,7 +64,9 @@ func (c *Coordinator) handleRegister(w http.ResponseWriter, r *http.Request) {
 	}
 
 	log.Printf("[coordinator] worker registered: %s (capacity=%d, version=%s)", id, req.Capacity, req.Version)
-	json.NewEncoder(w).Encode(RegisterRes{WorkerID: id})
+	if err := json.NewEncoder(w).Encode(RegisterRes{WorkerID: id}); err != nil {
+		log.Printf("[coordinator] write register response: %v", err)
+	}
 }
 
 func (c *Coordinator) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
@@ -135,16 +137,20 @@ func (c *Coordinator) handleClaimJob(w http.ResponseWriter, r *http.Request) {
 
 	// No job available — return empty response, worker will retry on next tick.
 	if job == nil {
-		json.NewEncoder(w).Encode(ClaimRes{Job: nil})
+		if err := json.NewEncoder(w).Encode(ClaimRes{Job: nil}); err != nil {
+			log.Printf("[coordinator] write claim response: %v", err)
+		}
 		return
 	}
 
 	log.Printf("[coordinator] job %s claimed by worker %s", job.ID, req.WorkerID)
-	json.NewEncoder(w).Encode(ClaimRes{Job: &JobAssignment{
+	if err := json.NewEncoder(w).Encode(ClaimRes{Job: &JobAssignment{
 		JobID:    job.ID,
 		Magnet:   job.Magnet,
 		InfoHash: job.InfoHash,
-	}})
+	}}); err != nil {
+		log.Printf("[coordinator] write claim response: %v", err)
+	}
 }
 
 // ── Job progress & lifecycle ──────────────────────────────────────────────────

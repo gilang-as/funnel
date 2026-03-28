@@ -120,9 +120,11 @@ Socket paths:
 ### S3 Storage Engine (root package)
 - `S3Storage.OpenTorrent()` creates an `s3Torrent` for each infoHash
 - Each file in the torrent becomes an `s3FileState` with `N` chunks of `ChunkSize` bytes
+- Chunk size auto-adjusts if file exceeds 10,000 parts; minimum non-final part size is 5 MB (`s3MinPartSize = 5<<20`) — S3 rejects smaller parts with `EntityTooSmall`
 - `s3Chunk.uploadIfComplete()` triggers once all pieces covering the chunk are marked complete
 - `finalizeMultipart()` calls `CompleteMultipartUpload` then deletes the state JSON
-- `gcLocalChunks()` evicts uploaded chunks once `activeChunks > localLimit` (default 2)
+- `gcLocalChunks()` evicts uploaded chunks once `activeChunks > localLimit` (default 2); called on **both success and failure** paths of `doUpload()`
+- AWS SDK v2 returns pointer types (`*bool`, `*int64`, etc.) — always use `aws.ToBool()` / `aws.ToInt64()` helpers, never dereference directly (may be nil on empty responses)
 - `findFile()` uses binary search (`fileStarts []int64`) for O(log n) piece→file mapping
 - `s3ReadCtx()` = 30s timeout; `s3WriteCtx()` = 5 min timeout
 - `retryDelay` is an `atomic.Value` wrapping `func(attempt int) time.Duration` — thread-safe swap in tests
@@ -160,12 +162,13 @@ JSON file:
 
 `SavedTorrent.Paused = true` → re-added on startup without starting download.
 
-`StateStore` interface (in `statestore.go`) abstracts over: JSON file, MySQL, Postgres, in-memory (worker).
+`StateStore` interface (in `statestore.go`) abstracts over: JSON file, MySQL, Postgres, in-memory (worker). Includes `Close() error` — MySQL/Postgres implementations close the underlying `*sql.DB`; file and memory implementations return nil. Always call `defer st.Close()` after obtaining a StateStore.
 
 ### Cluster Architecture
 - `funnel-manager` uses a SQL database (MySQL or Postgres) as shared state
 - `cluster.Coordinator` handles job distribution; exposes `/internal/` routes protected by Bearer token auth
 - `funnel-worker` runs `cluster.Agent` which polls the manager, claims jobs, runs them via `daemon.Manager`, reports progress
+- `claimJob` capacity check counts **only `downloading` and `queued` torrents** toward `capacity` — seeding jobs do not consume a slot
 - Join tokens are hashed (SHA-256) before storage; raw token shown only once on creation
 - `dbManager` in `cmd/manager/cmd/serve.go` bridges `daemon.managerIface` to SQL store
 
@@ -200,8 +203,14 @@ All routes use HTTP (over IPC socket for CLI, over TCP for standalone/manager).
 | `POST` | `/api/shutdown` | Graceful shutdown |
 
 Manager-only internal routes (Bearer token required):
-- `GET /internal/jobs/claim` — worker claims a queued job
+- `POST /internal/workers/register` — worker registers on startup
+- `POST /internal/workers/{id}/heartbeat` — worker heartbeat
+- `DELETE /internal/workers/{id}` — worker graceful leave
+- `POST /internal/jobs/claim` — worker atomically claims the next queued job
 - `POST /internal/jobs/{id}/progress` — worker reports progress
+- `POST /internal/jobs/{id}/complete` — worker marks job done (seeding)
+- `POST /internal/jobs/{id}/requeue` — worker requeues job on shutdown
+- `POST /internal/jobs/{id}/fail` — worker reports failure
 
 ---
 

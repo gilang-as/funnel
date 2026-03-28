@@ -113,7 +113,13 @@ func (a *Agent) claimJob(ctx context.Context) error {
 }
 
 func (a *Agent) heartbeat(ctx context.Context) error {
-	req := HeartbeatReq{ActiveJobs: len(a.mgr.List(""))}
+	active := 0
+	for _, t := range a.mgr.List("") {
+		if t.Status == daemon.StatusDownloading || t.Status == daemon.StatusQueued {
+			active++
+		}
+	}
+	req := HeartbeatReq{ActiveJobs: active}
 	return a.request(ctx, "POST", "/internal/workers/"+a.workerID+"/heartbeat", req, nil)
 }
 

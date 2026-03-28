@@ -28,6 +28,8 @@ func (s *memoryStateStore) List() []daemon.SavedTorrent {
 	return out
 }
 
+func (s *memoryStateStore) Close() error { return nil }
+
 func (s *memoryStateStore) Add(t daemon.SavedTorrent) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
