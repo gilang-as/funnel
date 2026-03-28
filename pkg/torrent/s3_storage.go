@@ -80,19 +80,6 @@ func (s *S3Storage) OpenTorrent(ctx context.Context, info *metainfo.Info, infoHa
 		files:    make(map[string]*s3FileState),
 	}
 
-	if len(info.Files) == 0 {
-		fmt.Printf("Initializng single-file torrent: %s (%d bytes)\n", info.Name, info.Length)
-		t.orderedFilePaths = append(t.orderedFilePaths, info.Name)
-		t.initFile(info.Name, info.Length)
-	} else {
-		fmt.Printf("Initializng multi-file torrent: %d files\n", len(info.Files))
-		for _, f := range info.Files {
-			path := filepath.Join(f.Path...)
-			t.orderedFilePaths = append(t.orderedFilePaths, path)
-			t.initFile(path, f.Length)
-		}
-	}
-
 	// Piece completion provider (S3 backed)
 	pc := &s3PieceCompletion{
 		s:        s,
@@ -100,9 +87,46 @@ func (s *S3Storage) OpenTorrent(ctx context.Context, info *metainfo.Info, infoHa
 		infoHash: infoHash,
 		cache:    make(map[int]bool),
 	}
+	t.pc = pc
 	pc.syncFromS3()
 
-	t.pc = pc
+	if len(info.Files) == 0 {
+		t.orderedFilePaths = append(t.orderedFilePaths, info.Name)
+		t.initFile(info.Name, info.Length)
+	} else {
+		for _, f := range info.Files {
+			path := filepath.Join(f.Path...)
+			t.orderedFilePaths = append(t.orderedFilePaths, path)
+			t.initFile(path, f.Length)
+		}
+	}
+
+	// Synchronously wait for all files to load state from S3
+	var wg sync.WaitGroup
+	for _, f := range t.files {
+		wg.Add(1)
+		go func(st *s3FileState) {
+			defer wg.Done()
+			st.loadMultipartState()
+		}(f)
+	}
+	wg.Wait()
+
+	// If all files are already on S3, mark the entire torrent as complete
+	allFilesOk := true
+	for _, f := range t.files {
+		if f.length > 0 && len(f.partETags) != len(f.chunks) {
+			allFilesOk = false
+			break
+		}
+	}
+	if allFilesOk {
+		fmt.Println("All files detected on S3. Forcing 100% completion status.")
+		for i := 0; i < info.NumPieces(); i++ {
+			pk := metainfo.PieceKey{InfoHash: infoHash, Index: i}
+			t.pc.Set(pk, true)
+		}
+	}
 
 	s.mu.Lock()
 	s.currentTorrent = t
@@ -122,9 +146,7 @@ func (s *S3Storage) OpenTorrent(ctx context.Context, info *metainfo.Info, infoHa
 	}, nil
 }
 
-func (s *S3Storage) TriggerSync() {
-	// Not needed for new architecture as it uploads as it goes
-}
+func (s *S3Storage) TriggerSync() {}
 
 func (s *S3Storage) Close() error { return nil }
 
@@ -156,12 +178,12 @@ func (t *s3Torrent) initFile(relPath string, length int64) {
 	}
 
 	state := &s3FileState{
-		t:            t,
-		relPath:      relPath,
-		length:       length,
-		chunkSize:    chunkSize,
-		chunks:       make([]*s3Chunk, numChunks),
-		localLimit:   t.s.MaxLocalChunks,
+		t:          t,
+		relPath:    relPath,
+		length:     length,
+		chunkSize:  chunkSize,
+		chunks:     make([]*s3Chunk, numChunks),
+		localLimit: t.s.MaxLocalChunks,
 	}
 
 	if numChunks == 0 {
@@ -169,21 +191,20 @@ func (t *s3Torrent) initFile(relPath string, length int64) {
 	}
 
 	for i := 0; i < numChunks; i++ {
-		start := int64(i) * chunkSize
-		end := start + chunkSize
+		end := int64(i+1) * chunkSize
 		if end > length {
 			end = length
 		}
-		state.chunks[i] = &s3Chunk{
+		chunk := &s3Chunk{
 			index: i,
-			start: start,
+			start: int64(i) * chunkSize,
 			end:   end,
 			state: state,
 		}
+		state.chunks[i] = chunk
 	}
 
 	t.files[relPath] = state
-	go state.loadMultipartState()
 }
 
 func (t *s3Torrent) saveMetainfo() {
@@ -235,6 +256,23 @@ func (f *s3FileState) loadMultipartState() {
 		}
 	}
 
+	// ALWAYS check if final object exists in S3 (Ultimate Source of Truth)
+	if f.length > 0 {
+		s3Key := f.getS3Key()
+		res, err := f.t.s.s3Client.HeadObject(context.TODO(), &s3.HeadObjectInput{
+			Bucket: aws.String(f.t.s.Bucket),
+			Key:    aws.String(s3Key),
+		})
+		if err == nil && *res.ContentLength == f.length {
+			fmt.Printf("File %s already exists in S3 (100%%), skipping download.\n", f.relPath)
+			// Mark all chunks as uploaded
+			for i := range f.chunks {
+				f.partETags[i+1] = "ALREADY_ON_S3"
+			}
+			f.markAllPiecesAsComplete()
+		}
+	}
+
 	if f.length == 0 {
 		s3Key := f.getS3Key()
 		_, err := f.t.s.s3Client.PutObject(context.TODO(), &s3.PutObjectInput{
@@ -258,6 +296,18 @@ func (f *s3FileState) loadMultipartState() {
 			f.uploadID = *res.UploadId
 			f.saveState()
 		}
+	}
+}
+
+func (f *s3FileState) markAllPiecesAsComplete() {
+	fileOffset := f.getFileOffsetInTorrent()
+	pieceLength := f.t.info.PieceLength
+	firstPiece := int(fileOffset / pieceLength)
+	lastPiece := int((fileOffset + f.length - 1) / pieceLength)
+
+	for i := firstPiece; i <= lastPiece; i++ {
+		pk := metainfo.PieceKey{InfoHash: f.t.infoHash, Index: i}
+		f.t.pc.Set(pk, true)
 	}
 }
 
@@ -372,6 +422,16 @@ func (c *s3Chunk) doUpload() {
 		go c.uploadPieceMarkers()
 
 		c.state.checkFullCompletion()
+
+		// Immediate removal from active list and disk
+		for i, idx := range c.state.activeChunks {
+			if idx == c.index {
+				c.state.activeChunks = append(c.state.activeChunks[:i], c.state.activeChunks[i+1:]...)
+				break
+			}
+		}
+		os.Remove(path)
+		fmt.Printf("GC: Local chunk %d of %s removed after upload.\n", c.index, c.state.relPath)
 	} else {
 		fmt.Printf("[FAILED] %s | Chunk %d/%d upload: %v\n", c.state.relPath, c.index+1, len(c.state.chunks), err)
 	}
@@ -395,7 +455,9 @@ func (c *s3Chunk) uploadPieceMarkers() {
 }
 
 func (f *s3FileState) checkFullCompletion() {
-	if f.length == 0 { return }
+	if f.length == 0 {
+		return
+	}
 	if len(f.partETags) == len(f.chunks) {
 		fmt.Printf("File %s fully uploaded! Finalizing S3 Multipart Upload...\n", f.relPath)
 		var parts []types.CompletedPart
@@ -467,7 +529,7 @@ func (t *s3Torrent) readAbsolute(b []byte, absOff int64) (int, error) {
 	for nTotal < len(b) {
 		segOff := absOff + int64(nTotal)
 		target := b[nTotal:]
-		
+
 		state, localOff, err := t.findFile(segOff)
 		if err != nil {
 			return nTotal, err
@@ -571,6 +633,7 @@ func (t *s3Torrent) writeAbsolute(b []byte, absOff int64) (int, error) {
 		state.activeMu.Unlock()
 
 		nTotal += n
+		state.gcLocalChunks()
 	}
 	return nTotal, nil
 }

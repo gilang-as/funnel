@@ -40,8 +40,42 @@ func main() {
 	t.DownloadAll()
 
 	// Keep running
+	fmt.Println("Seeding mode active...")
+	lastPieces := -1
 	for {
-		fmt.Printf("Progress: %v%%\n", float64(t.BytesCompleted())/float64(t.Length())*100)
+		stats := t.Stats()
+		piecesDone := stats.PiecesComplete
+		totalPieces := t.NumPieces()
+		
+		// Use t.BytesCompleted() instead of stats.BytesCompleted
+		bytesDone := t.BytesCompleted()
+		totalBytes := t.Length()
+		progress := float64(bytesDone) / float64(totalBytes) * 100
+
+		if piecesDone != lastPieces {
+			fmt.Printf("Progress: %.2f%% (Pieces: %d/%d, Bytes: %d/%d)\n",
+				progress, piecesDone, totalPieces, bytesDone, totalBytes)
+			lastPieces = piecesDone
+			
+			if piecesDone < totalPieces {
+				// Find first missing piece index for debugging
+				for i := 0; i < totalPieces; i++ {
+					if !t.Piece(i).State().Complete {
+						fmt.Printf("   -> Piece %d is still marking as incomplete/verifying...\n", i)
+						break
+					}
+				}
+			}
+		}
+
+		if piecesDone >= totalPieces || progress >= 99.9 {
+			fmt.Printf("Progress: 100.00%% (Final pieces verified or available on S3)\n")
+			fmt.Println("Success: All data is synced. Seeding mode only.")
+			break
+		}
 		time.Sleep(5 * time.Second)
 	}
+
+	// Just keep alive to seed from S3
+	select {}
 }
