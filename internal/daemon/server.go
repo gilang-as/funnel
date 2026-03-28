@@ -4,9 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"log"
+	"net"
 	"net/http"
 
-	"github.com/gilang/funnel/internal/ipc"
+	"gopkg.gilang.dev/funnel/internal/ipc"
 )
 
 // managerIface is the subset of Manager used by the HTTP server.
@@ -27,11 +28,23 @@ type Server struct {
 	srv    *http.Server
 }
 
-// NewServer creates a Server that uses IPC transport.
-func NewServer(mgr *Manager, cancel context.CancelFunc) *Server {
+// NewServer creates a Server with the given manager and cancellation function.
+func NewServer(mgr managerIface, cancel context.CancelFunc) *Server {
 	s := &Server{mgr: mgr, cancel: cancel}
 	mux := http.NewServeMux()
+	s.RegisterRoutes(mux)
+	s.srv = &http.Server{Handler: mux}
+	return s
+}
 
+// NewServerCustom creates a Server without an internal HTTP server or mux.
+// Useful when the caller manages the routing and server lifecycle.
+func NewServerCustom(mgr managerIface, cancel context.CancelFunc) *Server {
+	return &Server{mgr: mgr, cancel: cancel}
+}
+
+// RegisterRoutes registers the standard API routes to the given mux.
+func (s *Server) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/torrents", s.handleAdd)
 	mux.HandleFunc("GET /api/torrents", s.handleList)
 	mux.HandleFunc("PATCH /api/torrents/{id}", s.handleAction)
@@ -39,9 +52,6 @@ func NewServer(mgr *Manager, cancel context.CancelFunc) *Server {
 	mux.HandleFunc("DELETE /api/torrents/{id}", s.handleRemove)
 	mux.HandleFunc("GET /api/status", s.handleStatus)
 	mux.HandleFunc("POST /api/shutdown", s.handleShutdown)
-
-	s.srv = &http.Server{Handler: mux}
-	return s
 }
 
 // ListenAndServe starts the HTTP server over IPC transport.
@@ -50,7 +60,12 @@ func (s *Server) ListenAndServe() error {
 	if err != nil {
 		return err
 	}
-	log.Printf("[daemon] listening on %s", ipc.SocketPath())
+	return s.Serve(ln)
+}
+
+// Serve starts the HTTP server over the given listener.
+func (s *Server) Serve(ln net.Listener) error {
+	log.Printf("[daemon] listening on %s", ln.Addr())
 	return s.srv.Serve(ln)
 }
 
@@ -134,7 +149,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleShutdown(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
-	go s.cancel()
+	s.cancel()
 }
 
 func writeJSON(w http.ResponseWriter, code int, v any) {

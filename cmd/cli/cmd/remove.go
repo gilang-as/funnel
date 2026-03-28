@@ -7,7 +7,7 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/gilang/funnel/internal/daemon"
+	"gopkg.gilang.dev/funnel/internal/daemon"
 )
 
 var removeCmd = &cobra.Command{
@@ -37,6 +37,8 @@ func runRemove(cmd *cobra.Command, args []string) error {
 	}
 
 	var e daemon.ErrorResponse
-	json.NewDecoder(resp.Body).Decode(&e)
+	if err := json.NewDecoder(resp.Body).Decode(&e); err != nil || e.Error == "" {
+		return fmt.Errorf("daemon error (status %d)", resp.StatusCode)
+	}
 	return fmt.Errorf("daemon error: %s", e.Error)
 }

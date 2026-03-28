@@ -7,7 +7,7 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/gilang/funnel/internal/daemon"
+	"gopkg.gilang.dev/funnel/internal/daemon"
 )
 
 var listCmd = &cobra.Command{

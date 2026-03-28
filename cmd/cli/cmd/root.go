@@ -7,7 +7,7 @@ import (
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
 
-	"github.com/gilang/funnel/internal/ipc"
+	"gopkg.gilang.dev/funnel/internal/ipc"
 )
 
 var cfgFile string

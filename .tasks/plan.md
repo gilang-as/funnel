@@ -455,7 +455,7 @@ func (a *Agent) Run(ctx context.Context) error
 ```go
 package main
 
-import "github.com/gilang/funnel/cmd/standalone/cmd"
+import "github.com/gilang-as/funnel/cmd/standalone/cmd"
 func main() { cmd.Execute() }
 ```
 

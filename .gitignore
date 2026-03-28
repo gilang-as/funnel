@@ -1,4 +1,10 @@
 .volumes
 downloads
-./funnel
-./funnel.exe
+funnel
+funnel.exe
+funnel-manager
+funnel-manager.exe
+funnel-worker
+funnel-worker.exe
+funneld
+funneld.exe

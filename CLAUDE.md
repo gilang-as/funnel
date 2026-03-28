@@ -8,9 +8,20 @@ This file provides context for AI assistants (and human contributors) working on
 
 **Funnel** downloads BitTorrent content and streams it directly to S3-compatible object storage using a chunk-based multipart upload pipeline. Files are never permanently stored on disk — only a rolling buffer of at most 2 chunks (×10 MB) exists locally at any time.
 
-**Module**: `github.com/gilang/funnel`
-**Go version**: 1.22+
+**Module**: `gopkg.gilang.dev/funnel`
+**GitHub repo**: `github.com/gilang-as/funnel`
+**Go version**: 1.26 (go.mod), minimum 1.22
 **Main branch**: `main`
+
+---
+
+## Deployment Modes
+
+| Mode | Binary | Transport | State |
+|------|--------|-----------|-------|
+| CLI daemon | `funnel` (cmd/cli) | Unix socket / Named Pipe (IPC) | JSON file |
+| Standalone | `funneld` (cmd/standalone) | TCP | JSON file / MySQL / Postgres |
+| Cluster | `funnel-manager` + `funnel-worker` | TCP | MySQL / Postgres (shared) |
 
 ---
 
@@ -22,17 +33,18 @@ funnel/                         # root package "funnel" — S3 storage engine
   torrent.go                    # s3Torrent, s3Piece, read/write dispatch logic
   file.go                       # s3FileState, s3Chunk, multipart upload, GC
   piece.go                      # s3PieceCompletion, S3 piece markers
-  storage_test.go               # 11 integration-style tests (package funnel)
+  storage_test.go               # integration-style tests (package funnel)
 
 storages/
   s3.go                         # S3Config (with credentials), NewS3Storage factory
   local.go                      # localStorageImpl wrapping anacrolix file storage + DeleteTorrentData
 
 internal/daemon/
-  types.go                      # Status, TorrentInfo, AddRequest/Response, ActionRequest, DaemonStatus, ErrorResponse
+  types.go                      # Status, TorrentInfo, AddRequest/Response, ActionRequest, DaemonStatus, StorageInfo, ErrorResponse
   state.go                      # SavedTorrent, State — JSON persistence to disk
-  manager.go                    # Manager: torrent lifecycle, queue logic, watchTorrent goroutine
-  server.go                     # HTTP server over IPC; managerIface; all route handlers
+  statestore.go                 # StateStore interface (file/MySQL/Postgres/memory implementations)
+  manager.go                    # Manager: torrent lifecycle, queue logic, watchTorrent goroutine, StorageRemover interface
+  server.go                     # HTTP server; managerIface; RegisterRoutes; NewServerCustom; all route handlers
   state_test.go                 # State unit tests
   server_test.go                # Server handler tests (mock manager)
 
@@ -43,6 +55,9 @@ internal/ipc/
   dialer_unix.go                # NewHTTPClient() — HTTP over unix socket (!windows)
   dialer_windows.go             # NewHTTPClient() — HTTP over named pipe (windows, go-winio)
   ipc_test.go                   # SocketPath tests
+
+internal/cluster/               # Cluster coordinator: Coordinator, Agent, token generation/hashing
+internal/store/                 # Database store: Store interface, MySQL/Postgres/memory implementations
 
 cmd/cli/
   main.go                       # entry point: calls cmd.Execute()
@@ -58,6 +73,7 @@ cmd/cli/
   cmd/pause.go                  # `funnel pause <id>`
   cmd/resume.go                 # `funnel resume <id>`
   cmd/remove.go                 # `funnel remove <id>`
+  cmd/version.go                # `funnel --version` (Version var set by ldflags)
   cmd/autostart.go              # `funnel autostart enable|disable` (Cobra command)
   cmd/autostart_darwin.go       # macOS: LaunchAgents plist + launchctl
   cmd/autostart_linux.go        # Linux: systemd user unit
@@ -67,21 +83,39 @@ cmd/cli/
   cmd/spawn_windows.go          # spawnDaemon() with CREATE_NEW_PROCESS_GROUP (windows)
   cmd/commands_test.go          # CLI command tests (httptest server override)
 
+cmd/standalone/
+  main.go                       # entry point: calls cmd.Execute() → funneld
+  cmd/root.go                   # --port, --state, --db-dsn flags; Viper init
+  cmd/serve.go                  # `funneld serve` — TCP daemon; buildStorage(), buildStateStore()
+
+cmd/manager/
+  main.go                       # entry point: funnel-manager
+  cmd/root.go                   # --port, --db-driver, --db-dsn flags
+  cmd/serve.go                  # `funnel-manager serve` — cluster coordinator; dbManager; RegisterRoutes + /internal/ with auth
+  cmd/token.go                  # `funnel-manager token create|list|revoke`
+
+cmd/worker/
+  main.go                       # entry point: funnel-worker
+  cmd/root.go                   # --manager, --token, --capacity, --storage-* flags
+  cmd/run.go                    # `funnel-worker run` — cluster agent; cluster.NewAgent
+
 docker-compose.yml              # MinIO local dev
-Dockerfile                      # Container build
+Dockerfile                      # Multi-binary image (ARG CMD=standalone|manager|worker, ARG VERSION)
 ```
 
 ---
 
 ## Key Design Decisions
 
-### IPC Transport (not TCP)
-The daemon listens on a Unix domain socket / Named Pipe — no TCP port is opened. The HTTP protocol is used over the socket. URL base is `http://localhost` (host is ignored; the transport determines the connection).
+### IPC Transport (CLI daemon only)
+The `funnel` CLI daemon listens on a Unix domain socket / Named Pipe — no TCP port is opened. The HTTP protocol is used over the socket. URL base is `http://localhost` (host is ignored; the transport determines the connection).
 
 Socket paths:
 - macOS: `~/Library/Application Support/funnel/funnel.sock`
 - Linux: `$XDG_RUNTIME_DIR/funnel.sock` → `~/.local/share/funnel/funnel.sock`
 - Windows: `\\.\pipe\funnel`
+
+`funneld` and `funnel-manager` listen on TCP (`--port 8080`).
 
 ### S3 Storage Engine (root package)
 - `S3Storage.OpenTorrent()` creates an `s3Torrent` for each infoHash
@@ -91,6 +125,7 @@ Socket paths:
 - `gcLocalChunks()` evicts uploaded chunks once `activeChunks > localLimit` (default 2)
 - `findFile()` uses binary search (`fileStarts []int64`) for O(log n) piece→file mapping
 - `s3ReadCtx()` = 30s timeout; `s3WriteCtx()` = 5 min timeout
+- `retryDelay` is an `atomic.Value` wrapping `func(attempt int) time.Duration` — thread-safe swap in tests
 
 ### Queue Logic (Manager)
 - `maxActive` (default 3) limits concurrent downloads; configurable via config/env/flag
@@ -118,29 +153,41 @@ Always acquire in this order to prevent deadlocks:
 2. `mt.mu` (managedTorrent Mutex — protects `mt.status`, `mt.t`, `mt.name`)
 
 ### State Persistence
-Stored as JSON:
+JSON file:
 - macOS: `~/Library/Application Support/funnel/state.json`
 - Linux: `~/.local/share/funnel/state.json`
 - Windows: `%APPDATA%\funnel\state.json`
 
 `SavedTorrent.Paused = true` → re-added on startup without starting download.
 
-### StorageRemover Interface
-Defined in `internal/daemon/manager.go`. Called by `Manager.Remove()`:
-- `S3Storage` → lists and deletes all objects with prefix `{infoHash}/`
-- `localStorageImpl` → `os.RemoveAll(dir/{infoHash})`
+`StateStore` interface (in `statestore.go`) abstracts over: JSON file, MySQL, Postgres, in-memory (worker).
 
-### Server testability
-`Server.mgr` uses `managerIface` (not concrete `*Manager`), so tests can inject a `mockManager`.
+### Cluster Architecture
+- `funnel-manager` uses a SQL database (MySQL or Postgres) as shared state
+- `cluster.Coordinator` handles job distribution; exposes `/internal/` routes protected by Bearer token auth
+- `funnel-worker` runs `cluster.Agent` which polls the manager, claims jobs, runs them via `daemon.Manager`, reports progress
+- Join tokens are hashed (SHA-256) before storage; raw token shown only once on creation
+- `dbManager` in `cmd/manager/cmd/serve.go` bridges `daemon.managerIface` to SQL store
+
+### Server Design
+- `daemon.NewServer(mgr, cancel)` — standard IPC server for CLI and standalone
+- `daemon.NewServerCustom(mgr, cancel)` — exposes `RegisterRoutes(mux)` for embedding in manager's mux
+- `Server.mgr` uses `managerIface` (not concrete `*Manager`), so tests can inject a `mockManager`
 
 ### CLI testability
 `cmd/client.go` exposes `apiBase` (var) and `httpClientOverride` (var) so tests can redirect to an `httptest.Server` without touching the IPC socket.
+
+### Build: No CGO
+All binaries build with `CGO_ENABLED=0`. No `import "C"` anywhere. `go-winio` uses pure-Go Windows syscalls. `build-race` intentionally omits `CGO_ENABLED=0` since the race detector requires CGO.
+
+### Binary Size
+ldflags `-s -w` strips symbol table and DWARF debug info. Applied in `Makefile`, `release.yml`, and `Dockerfile`.
 
 ---
 
 ## REST API
 
-All routes use HTTP over IPC socket.
+All routes use HTTP (over IPC socket for CLI, over TCP for standalone/manager).
 
 | Method | Path | Description |
 |--------|------|-------------|
@@ -149,8 +196,12 @@ All routes use HTTP over IPC socket.
 | `PATCH` | `/api/torrents/{id}` | Action — body: `{"action":"pause"\|"resume"}` |
 | `POST` | `/api/torrents/{id}/stop` | Stop/disconnect (data kept) |
 | `DELETE` | `/api/torrents/{id}` | Remove + delete data |
-| `GET` | `/api/status` | Daemon status + per-state counts |
+| `GET` | `/api/status` | Daemon status + per-state counts + storage info |
 | `POST` | `/api/shutdown` | Graceful shutdown |
+
+Manager-only internal routes (Bearer token required):
+- `GET /internal/jobs/claim` — worker claims a queued job
+- `POST /internal/jobs/{id}/progress` — worker reports progress
 
 ---
 
@@ -160,11 +211,22 @@ All routes use HTTP over IPC socket.
 |-----|---------|---------|-------------|
 | `storage.type` | `local` | `FUNNEL_STORAGE_TYPE` | `local` or `s3` |
 | `storage.local.dir` | `~/Downloads/funnel` | `FUNNEL_STORAGE_LOCAL_DIR` | Local dir |
-| `storage.s3.*` | — | `FUNNEL_STORAGE_S3_*` | S3 credentials and config |
+| `storage.s3.endpoint` | — | `FUNNEL_STORAGE_S3_ENDPOINT` | S3 endpoint |
+| `storage.s3.bucket` | — | `FUNNEL_STORAGE_S3_BUCKET` | S3 bucket |
+| `storage.s3.access-key` | — | `FUNNEL_STORAGE_S3_ACCESS_KEY` | S3 access key |
+| `storage.s3.secret-key` | — | `FUNNEL_STORAGE_S3_SECRET_KEY` | S3 secret key |
+| `storage.s3.region` | `us-east-1` | `FUNNEL_STORAGE_S3_REGION` | S3 region |
+| `storage.s3.base-dir` | `downloads` | `FUNNEL_STORAGE_S3_BASE_DIR` | Key prefix |
 | `upload-rate` | `524288` | `FUNNEL_UPLOAD_RATE` | Upload bytes/sec (0 = unlimited) |
 | `max-active` | `3` | `FUNNEL_MAX_ACTIVE` | Max concurrent downloads |
+| `port` | `8080` | `FUNNEL_PORT` | TCP port (standalone/manager) |
+| `state` | `file` | `FUNNEL_STATE` | State store: file/mysql/postgres |
+| `db-dsn` | — | `FUNNEL_DB_DSN` | Database DSN |
+| `manager` | `http://localhost:8080` | `FUNNEL_MANAGER` | Manager URL (worker) |
+| `token` | — | `FUNNEL_JOIN_TOKEN` | Cluster join token (worker) |
+| `capacity` | `3` | `FUNNEL_CAPACITY` | Max jobs per worker |
 
-Config file location: `~/.config/funnel/config.yaml`
+Config file: `~/.config/funnel/config.yaml`
 
 ---
 
@@ -199,6 +261,18 @@ docker compose up -d
 
 ---
 
+## CI / CD (GitHub Actions)
+
+| Workflow | File | Trigger | What it does |
+|----------|------|---------|--------------|
+| CI | `.github/workflows/ci.yml` | push/PR to main (Go/mod files) | Build + vet + test (Linux, macOS); cross-compile Windows; coverage upload |
+| Release | `.github/workflows/release.yml` | GitHub Release published | Build 7 static binaries (funnel: 5 platforms, funneld: Linux amd64+arm64); upload to release |
+| Images | `.github/workflows/images.yml` | GitHub Release published | Build + push Docker images (standalone, manager, worker) to Docker Hub with GHA cache |
+
+Release binary naming: `{funnel|funneld}-{os}-{arch}[.exe]`
+
+---
+
 ## Dependencies
 
 | Package | Purpose |
@@ -209,3 +283,7 @@ docker compose up -d
 | `github.com/spf13/viper` | Config management |
 | `github.com/Microsoft/go-winio` | Named Pipe support on Windows |
 | `golang.org/x/time/rate` | Upload rate limiter |
+| `github.com/go-sql-driver/mysql` | MySQL driver (cluster state) |
+| `github.com/lib/pq` | Postgres driver (cluster state) |
+| `github.com/google/uuid` | UUID generation (cluster job IDs, token IDs) |
+| `github.com/Masterminds/squirrel` | SQL query builder |

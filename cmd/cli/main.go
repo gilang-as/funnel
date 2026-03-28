@@ -1,7 +1,7 @@
 package main
 
 import (
-	"github.com/gilang/funnel/cmd/cli/cmd"
+	"gopkg.gilang.dev/funnel/cmd/cli/cmd"
 )
 
 func main() {

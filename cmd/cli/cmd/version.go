@@ -8,7 +8,7 @@ import (
 
 // Version is set at build time via:
 //
-//	go build -ldflags "-X github.com/gilang/funnel/cmd/cli/cmd.Version=v1.2.3"
+//	go build -ldflags "-X gopkg.gilang.dev/funnel/cmd/cli/cmd.Version=v1.2.3"
 //
 // Defaults to "Development" when built without the flag.
 var Version = "Development"

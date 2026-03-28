@@ -69,6 +69,7 @@ func (f *s3FileState) loadMultipartState() {
 		Key:    aws.String(f.stateKey()),
 	})
 	if err == nil {
+		defer output.Body.Close()
 		var data struct {
 			UploadID  string
 			PartETags map[int]string
@@ -78,7 +79,6 @@ func (f *s3FileState) loadMultipartState() {
 			savedETags = data.PartETags
 			log.Printf("Resuming multipart upload for %s: %s\n", f.relPath, savedUploadID)
 		}
-		output.Body.Close()
 	}
 
 	// Periksa apakah file sudah ada di S3 (source of truth).
@@ -90,7 +90,7 @@ func (f *s3FileState) loadMultipartState() {
 			Key:    aws.String(f.s3Key()),
 		})
 		hcancel()
-		if err == nil && *res.ContentLength == f.length {
+		if err == nil && aws.ToInt64(res.ContentLength) == f.length {
 			log.Printf("File %s already on S3, skipping.\n", f.relPath)
 			alreadyOnS3 = true
 		}
@@ -321,6 +321,7 @@ func (c *s3Chunk) doUpload() {
 			c.state.activeMu.Lock()
 			c.uploading = false
 			c.state.activeMu.Unlock()
+			c.state.gcLocalChunks()
 			return
 		}
 		uploadID = *res.UploadId
@@ -353,6 +354,7 @@ func (c *s3Chunk) doUpload() {
 	if err != nil {
 		c.state.activeMu.Unlock()
 		log.Printf("[FAILED] %s | Chunk %d/%d: %v\n", c.state.relPath, c.index+1, len(c.state.chunks), err)
+		c.state.gcLocalChunks()
 		return
 	}
 

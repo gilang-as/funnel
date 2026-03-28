@@ -107,7 +107,7 @@ func (pc *s3PieceCompletion) syncFromS3() {
 			pc.mu.Unlock()
 		}
 
-		if !*res.IsTruncated || res.NextContinuationToken == nil {
+		if !aws.ToBool(res.IsTruncated) || res.NextContinuationToken == nil {
 			break
 		}
 		continuationToken = res.NextContinuationToken

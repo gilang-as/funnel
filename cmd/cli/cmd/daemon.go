@@ -14,8 +14,8 @@ import (
 	"github.com/spf13/viper"
 
 	"github.com/anacrolix/torrent/storage"
-	"github.com/gilang/funnel/internal/daemon"
-	"github.com/gilang/funnel/storages"
+	"gopkg.gilang.dev/funnel/internal/daemon"
+	"gopkg.gilang.dev/funnel/storages"
 )
 
 var daemonCmd = &cobra.Command{

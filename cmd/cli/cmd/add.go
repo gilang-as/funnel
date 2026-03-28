@@ -8,7 +8,7 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/gilang/funnel/internal/daemon"
+	"gopkg.gilang.dev/funnel/internal/daemon"
 )
 
 var addCmd = &cobra.Command{
@@ -34,12 +34,16 @@ func runAdd(cmd *cobra.Command, args []string) error {
 
 	if resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusOK {
 		var e daemon.ErrorResponse
-		json.NewDecoder(resp.Body).Decode(&e)
+		if err := json.NewDecoder(resp.Body).Decode(&e); err != nil || e.Error == "" {
+			return fmt.Errorf("daemon error (status %d)", resp.StatusCode)
+		}
 		return fmt.Errorf("daemon error: %s", e.Error)
 	}
 
 	var r daemon.AddResponse
-	json.NewDecoder(resp.Body).Decode(&r)
+	if err := json.NewDecoder(resp.Body).Decode(&r); err != nil {
+		return fmt.Errorf("unexpected response from daemon: %w", err)
+	}
 	if !r.New {
 		fmt.Printf("Already exists [%s]: %s\n", r.Status, r.ID)
 	} else {

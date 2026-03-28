@@ -6,7 +6,7 @@
 using chunk-based multipart upload. Files are never permanently on disk — only ≤2 chunks
 (×10 MB) live locally at any time.
 
-**Module**: `github.com/gilang/funnel`
+**Module**: `github.com/gilang-as/funnel`
 **Go version**: 1.26
 **Main branch**: `main`
 

@@ -9,7 +9,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/gilang/funnel/internal/daemon"
+	"gopkg.gilang.dev/funnel/internal/daemon"
 )
 
 // setupTestServer points all CLI API calls at the given handler.

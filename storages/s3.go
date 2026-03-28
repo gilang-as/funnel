@@ -9,7 +9,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 
-	funnel "github.com/gilang/funnel"
+	funnel "gopkg.gilang.dev/funnel"
 )
 
 // S3Config holds all S3 connection parameters including credentials.

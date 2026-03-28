@@ -7,30 +7,30 @@ on:
 permissions:
   contents: write
 
+defaults:
+  run:
+    shell: bash -euo pipefail {0}
+
 jobs:
+  # ── Build + Package + Upload ───────────────────────────────────────────────────
   build:
-    name: Build / ${{ matrix.suffix }}
+    name: Build / ${{ matrix.binary }}-${{ matrix.goos }}-${{ matrix.goarch }}
     runs-on: ubuntu-latest
+    env:
+      PKG_DESCRIPTION: ${{ github.event.repository.description }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - goos: darwin
-            goarch: amd64
-            suffix: darwin-amd64
-          - goos: darwin
-            goarch: arm64
-            suffix: darwin-arm64
-          - goos: linux
-            goarch: amd64
-            suffix: linux-amd64
-          - goos: linux
-            goarch: arm64
-            suffix: linux-arm64
-          - goos: windows
-            goarch: amd64
-            suffix: windows-amd64
-            ext: .exe
+          # funnel (CLI) — all platforms
+          - {goos: darwin,  goarch: amd64, cmd: cli,        binary: funnel,  pkg: false}
+          - {goos: darwin,  goarch: arm64, cmd: cli,        binary: funnel,  pkg: false}
+          - {goos: linux,   goarch: amd64, cmd: cli,        binary: funnel,  pkg: true}
+          - {goos: linux,   goarch: arm64, cmd: cli,        binary: funnel,  pkg: true}
+          - {goos: windows, goarch: amd64, cmd: cli,        binary: funnel,  pkg: false, ext: .exe}
+          # funneld (standalone) — Linux only
+          - {goos: linux,   goarch: amd64, cmd: standalone, binary: funneld, pkg: true}
+          - {goos: linux,   goarch: arm64, cmd: standalone, binary: funneld, pkg: true}
 
     steps:
       - uses: actions/checkout@v4
@@ -40,18 +40,125 @@ jobs:
           go-version-file: go.mod
           cache: true
 
-      - name: Build
+      # ── Compile ────────────────────────────────────────────────────────────────
+
+      - name: Compile
         env:
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: "0"
         run: |
           go build \
-            -ldflags "-X github.com/gilang/funnel/cmd/cli/cmd.Version=${{ github.event.release.tag_name }}" \
-            -o funnel-${{ matrix.suffix }}${{ matrix.ext }} \
-            ./cmd/cli
+            -ldflags "-s -w -X gopkg.gilang.dev/funnel/cmd/${{ matrix.cmd }}/cmd.Version=${{ github.event.release.tag_name }}" \
+            -o "${{ matrix.binary }}${{ matrix.ext }}" \
+            ./cmd/${{ matrix.cmd }}
 
-      - name: Upload to release
+      # ── Archive (.tar.gz / .zip) ───────────────────────────────────────────────
+
+      - name: Package archive
+        run: |
+          VERSION="${{ github.event.release.tag_name }}"
+          VER="${VERSION#v}"
+          BINARY="${{ matrix.binary }}"
+          GOOS="${{ matrix.goos }}"
+          GOARCH="${{ matrix.goarch }}"
+
+          PKG_DIR="${BINARY}_${VER}_${GOOS}_${GOARCH}"
+          mkdir -p "dist/${PKG_DIR}"
+
+          cp "${BINARY}${{ matrix.ext }}" "dist/${PKG_DIR}/"
+          if [ -f README.md ]; then cp README.md "dist/${PKG_DIR}/"; fi
+          if [ -f LICENSE ];   then cp LICENSE   "dist/${PKG_DIR}/"; fi
+
+          cd dist
+          if [ "$GOOS" = "windows" ]; then
+            zip -r "${PKG_DIR}.zip" "${PKG_DIR}"
+          else
+            tar -czf "${PKG_DIR}.tar.gz" "${PKG_DIR}"
+          fi
+
+      # ── .deb and .rpm (Linux only) ─────────────────────────────────────────────
+
+      - name: Install fpm
+        if: matrix.pkg == true
+        run: |
+          sudo apt-get install -y ruby ruby-dev rubygems build-essential
+          sudo gem install --no-document fpm
+
+      - name: Build .deb package
+        if: matrix.pkg == true
+        run: |
+          VERSION="${{ github.event.release.tag_name }}"
+          VER="${VERSION#v}"
+          BINARY="${{ matrix.binary }}"
+          GOARCH="${{ matrix.goarch }}"
+
+          fpm \
+            -s dir -t deb \
+            --name "${BINARY}" \
+            --version "${VER}" \
+            --architecture "${GOARCH}" \
+            --description "${PKG_DESCRIPTION}" \
+            --url "https://github.com/gilang-as/funnel" \
+            --license "MIT" \
+            --force \
+            "${BINARY}=/usr/bin/${BINARY}"
+
+          mv "${BINARY}_${VER}_${GOARCH}.deb" "dist/${BINARY}_${VER}_linux_${GOARCH}.deb"
+
+      - name: Build .rpm package
+        if: matrix.pkg == true
+        run: |
+          VERSION="${{ github.event.release.tag_name }}"
+          VER="${VERSION#v}"
+          BINARY="${{ matrix.binary }}"
+          GOARCH="${{ matrix.goarch }}"
+
+          if [ "$GOARCH" = "amd64" ]; then RPM_ARCH="x86_64"; else RPM_ARCH="aarch64"; fi
+
+          fpm \
+            -s dir -t rpm \
+            --name "${BINARY}" \
+            --version "${VER}" \
+            --architecture "${RPM_ARCH}" \
+            --description "${PKG_DESCRIPTION}" \
+            --url "https://github.com/gilang-as/funnel" \
+            --license "MIT" \
+            --force \
+            "${BINARY}=/usr/bin/${BINARY}"
+
+          mv "${BINARY}-${VER}-1.${RPM_ARCH}.rpm" "dist/${BINARY}_${VER}_linux_${GOARCH}.rpm"
+
+      # ── Upload all dist/* to release in one shot ───────────────────────────────
+
+      - name: Upload artifacts
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ github.event.release.tag_name }}
-          files: funnel-${{ matrix.suffix }}${{ matrix.ext }}
+          files: dist/*
+
+  # ── Checksums ──────────────────────────────────────────────────────────────────
+  checksums:
+    name: Generate checksums.txt
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - name: Download all release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p dist
+          gh release download "${{ github.event.release.tag_name }}" \
+            --repo "${{ github.repository }}" \
+            --dir dist \
+            --skip-existing
+
+      - name: Generate SHA-256 checksums
+        run: |
+          cd dist
+          shasum -a 256 * > checksums.txt
+          cat checksums.txt
+
+      - name: Upload checksums.txt
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/checksums.txt

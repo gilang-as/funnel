@@ -2,8 +2,9 @@ BINARY   := funnel
 CMD      := ./cmd/cli
 INSTALL  := /usr/local/bin/$(BINARY)
 VERSION  := Development
-PKG      := github.com/gilang/funnel/cmd/cli/cmd
-LDFLAGS  := -ldflags "-X $(PKG).Version=$(VERSION)"
+PKG      := gopkg.gilang.dev/funnel/cmd/cli/cmd
+LDFLAGS  := -ldflags "-s -w -X $(PKG).Version=$(VERSION)"
+CGO_ENABLED := 0
 
 .PHONY: build test vet lint clean install uninstall \
         daemon start stop status list add minio minio-down
@@ -11,7 +12,7 @@ LDFLAGS  := -ldflags "-X $(PKG).Version=$(VERSION)"
 # ── Build ─────────────────────────────────────────────────────────────────────
 
 build:
-	go build $(LDFLAGS) -o $(BINARY) $(CMD)
+	CGO_ENABLED=$(CGO_ENABLED) go build $(LDFLAGS) -o $(BINARY) $(CMD)
 
 build-race:
 	go build -race $(LDFLAGS) -o $(BINARY) $(CMD)

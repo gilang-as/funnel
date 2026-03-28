@@ -3,7 +3,7 @@ package cmd
 import (
 	"net/http"
 
-	"github.com/gilang/funnel/internal/ipc"
+	"gopkg.gilang.dev/funnel/internal/ipc"
 )
 
 // apiBase and httpClientOverride can be replaced in tests.

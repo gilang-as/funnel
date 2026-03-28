@@ -137,7 +137,7 @@ func (s *S3Storage) DeleteTorrentData(ctx context.Context, infoHash string) erro
 				log.Printf("[WARN] delete %s: %v", *obj.Key, err)
 			}
 		}
-		if !*out.IsTruncated || out.NextContinuationToken == nil {
+		if !aws.ToBool(out.IsTruncated) || out.NextContinuationToken == nil {
 			break
 		}
 		token = out.NextContinuationToken

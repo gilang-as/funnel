@@ -71,9 +71,13 @@ func (t *s3Torrent) initFile(relPath string, length int64) {
 	if chunkSize < defaultChunkSize {
 		chunkSize = defaultChunkSize
 	}
-	// S3 limit: 10.000 parts per file.
+	// S3 limit: 10.000 parts per file; minimum non-final part size is 5 MB.
+	const s3MinPartSize int64 = 5 * 1024 * 1024
 	if length > chunkSize*10000 {
 		chunkSize = (length / 10000) + 1
+		if chunkSize < s3MinPartSize {
+			chunkSize = s3MinPartSize
+		}
 	}
 
 	numChunks := int((length + chunkSize - 1) / chunkSize)
