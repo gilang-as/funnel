@@ -1,6 +1,6 @@
 # Funnel
 
-[![CI](https://github.com/gilang/funnel/actions/workflows/ci.yml/badge.svg)](https://github.com/gilang/funnel/actions/workflows/ci.yml)
+[![CI](https://github.com/gilang-as/funnel/actions/workflows/ci.yml/badge.svg)](https://github.com/gilang/funnel/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/gilang/funnel)](https://github.com/gilang/funnel/releases/latest)
 [![Coverage](https://codecov.io/gh/gilang/funnel/branch/main/graph/badge.svg)](https://codecov.io/gh/gilang/funnel)
 [![Go](https://img.shields.io/badge/go-1.22+-00ADD8?logo=go&logoColor=white)](https://golang.org)
