@@ -1,4 +1,4 @@
-package torrent
+package funnel
 
 import (
 	"context"
@@ -136,7 +136,7 @@ func (m *mockS3) ListObjectsV2(_ context.Context, params *s3.ListObjectsV2Input,
 // ---------------------------------------------------------------------------
 
 type slowMockS3 struct {
-	s3API
+	S3Client
 	block    chan struct{}
 	released chan struct{}
 	once     sync.Once
@@ -145,14 +145,14 @@ type slowMockS3 struct {
 func (m *slowMockS3) UploadPart(ctx context.Context, params *s3.UploadPartInput, opts ...func(*s3.Options)) (*s3.UploadPartOutput, error) {
 	m.once.Do(func() { close(m.released) })
 	<-m.block
-	return m.s3API.UploadPart(ctx, params, opts...)
+	return m.S3Client.UploadPart(ctx, params, opts...)
 }
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
-func newTestStorage(t *testing.T, client s3API) *S3Storage {
+func newTestStorage(t *testing.T, client S3Client) *S3Storage {
 	t.Helper()
 	return &S3Storage{
 		Bucket:         "test-bucket",
@@ -567,7 +567,7 @@ func TestDoUpload_MutexReleasedDuringS3Call(t *testing.T) {
 	released := make(chan struct{})
 
 	slow := &slowMockS3{
-		s3API:    newMockS3(),
+		S3Client: newMockS3(),
 		block:    block,
 		released: released,
 	}
@@ -578,7 +578,7 @@ func TestDoUpload_MutexReleasedDuringS3Call(t *testing.T) {
 	tor := newS3Torrent(s, info, infoHash)
 
 	state := tor.files[info.Name]
-	setupMultipart(t, tor, slow.s3API.(*mockS3))
+	setupMultipart(t, tor, slow.S3Client.(*mockS3))
 
 	chunk := state.chunks[0]
 	writeChunkToDisk(t, chunk)
@@ -867,7 +867,7 @@ func TestWriteAndUpload_SingleFile(t *testing.T) {
 	s := newTestStorage(t, mock)
 	s.MaxLocalChunks = 10 // jangan GC selama test
 
-	pieceLen := int64(256 * 1024) // 256KB
+	pieceLen := int64(256 * 1024)  // 256KB
 	fileSize := int64(1024 * 1024) // 1MB
 	info := makeInfo("myfile", pieceLen, singleFile(fileSize))
 	var infoHash metainfo.Hash

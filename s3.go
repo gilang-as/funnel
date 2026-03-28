@@ -1,4 +1,4 @@
-package torrent
+package funnel
 
 import (
 	"context"
@@ -10,8 +10,6 @@ import (
 	"github.com/anacrolix/torrent/metainfo"
 	"github.com/anacrolix/torrent/storage"
 	"github.com/aws/aws-sdk-go-v2/aws"
-	"github.com/aws/aws-sdk-go-v2/config"
-	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 )
 
@@ -24,8 +22,8 @@ const (
 	s3WriteTimeout       = 5 * time.Minute
 )
 
-// s3API adalah subset operasi S3 yang dipakai, memudahkan mocking di tests.
-type s3API interface {
+// S3Client adalah subset operasi S3 yang dipakai, memudahkan mocking di tests.
+type S3Client interface {
 	PutObject(ctx context.Context, params *s3.PutObjectInput, optFns ...func(*s3.Options)) (*s3.PutObjectOutput, error)
 	GetObject(ctx context.Context, params *s3.GetObjectInput, optFns ...func(*s3.Options)) (*s3.GetObjectOutput, error)
 	HeadObject(ctx context.Context, params *s3.HeadObjectInput, optFns ...func(*s3.Options)) (*s3.HeadObjectOutput, error)
@@ -36,48 +34,41 @@ type s3API interface {
 	DeleteObject(ctx context.Context, params *s3.DeleteObjectInput, optFns ...func(*s3.Options)) (*s3.DeleteObjectOutput, error)
 }
 
+// Config holds S3Storage configuration (no credentials).
+type Config struct {
+	Bucket         string
+	BaseDir        string
+	ChunkSize      int64
+	MaxLocalChunks int
+}
+
 // S3Storage adalah storage backend untuk anacrolix/torrent yang menyimpan
 // file langsung ke S3 via multipart upload berbasis chunk.
 type S3Storage struct {
 	Bucket         string
-	Endpoint       string
-	AccessKey      string
-	SecretKey      string
-	Region         string
 	BaseDir        string
 	ChunkSize      int64
 	MaxLocalChunks int
 
-	client    s3API
+	client    S3Client
 	uploadSem chan struct{} // membatasi concurrent S3 uploads
 }
 
-func NewS3Storage() *S3Storage {
-	s := &S3Storage{
-		Bucket:         "funnel",
-		Endpoint:       "http://localhost:9000",
-		AccessKey:      "user",
-		SecretKey:      "password",
-		Region:         "us-east-1",
-		BaseDir:        "./downloads",
-		ChunkSize:      defaultChunkSize,
-		MaxLocalChunks: maxLocalChunks,
+func NewS3Storage(cfg Config, client S3Client) *S3Storage {
+	if cfg.ChunkSize == 0 {
+		cfg.ChunkSize = defaultChunkSize
+	}
+	if cfg.MaxLocalChunks == 0 {
+		cfg.MaxLocalChunks = maxLocalChunks
+	}
+	return &S3Storage{
+		Bucket:         cfg.Bucket,
+		BaseDir:        cfg.BaseDir,
+		ChunkSize:      cfg.ChunkSize,
+		MaxLocalChunks: cfg.MaxLocalChunks,
 		uploadSem:      make(chan struct{}, maxConcurrentUploads),
+		client:         client,
 	}
-
-	cfg, err := config.LoadDefaultConfig(context.Background(),
-		config.WithRegion(s.Region),
-		config.WithCredentialsProvider(credentials.NewStaticCredentialsProvider(s.AccessKey, s.SecretKey, "")),
-	)
-	if err != nil {
-		log.Fatalf("S3 config error: %v", err)
-	}
-	s.client = s3.NewFromConfig(cfg, func(o *s3.Options) {
-		o.BaseEndpoint = aws.String(s.Endpoint)
-		o.UsePathStyle = true
-	})
-
-	return s
 }
 
 func (s *S3Storage) OpenTorrent(ctx context.Context, info *metainfo.Info, infoHash metainfo.Hash) (storage.TorrentImpl, error) {
@@ -124,6 +115,35 @@ func (s *S3Storage) OpenTorrent(ctx context.Context, info *metainfo.Info, infoHa
 }
 
 func (s *S3Storage) Close() error { return nil }
+
+// DeleteTorrentData removes all S3 objects under the torrent's prefix.
+func (s *S3Storage) DeleteTorrentData(ctx context.Context, infoHash string) error {
+	prefix := infoHash + "/"
+	var token *string
+	for {
+		out, err := s.client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
+			Bucket:            aws.String(s.Bucket),
+			Prefix:            aws.String(prefix),
+			ContinuationToken: token,
+		})
+		if err != nil {
+			return fmt.Errorf("list objects: %w", err)
+		}
+		for _, obj := range out.Contents {
+			if _, err := s.client.DeleteObject(ctx, &s3.DeleteObjectInput{
+				Bucket: aws.String(s.Bucket),
+				Key:    obj.Key,
+			}); err != nil {
+				log.Printf("[WARN] delete %s: %v", *obj.Key, err)
+			}
+		}
+		if !*out.IsTruncated || out.NextContinuationToken == nil {
+			break
+		}
+		token = out.NextContinuationToken
+	}
+	return nil
+}
 
 // s3ReadCtx returns a context with timeout for S3 read operations.
 func s3ReadCtx() (context.Context, context.CancelFunc) {
