@@ -1,10 +1,10 @@
 package torrent
 
 import (
-	"context"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"sort"
@@ -56,7 +56,9 @@ func (f *s3FileState) loadMultipartState() {
 	var savedUploadID string
 	var savedETags map[int]string
 
-	output, err := f.t.s.client.GetObject(context.TODO(), &s3.GetObjectInput{
+	rctx, rcancel := s3ReadCtx()
+	defer rcancel()
+	output, err := f.t.s.client.GetObject(rctx, &s3.GetObjectInput{
 		Bucket: aws.String(f.t.s.Bucket),
 		Key:    aws.String(f.stateKey()),
 	})
@@ -68,7 +70,7 @@ func (f *s3FileState) loadMultipartState() {
 		if json.NewDecoder(output.Body).Decode(&data) == nil {
 			savedUploadID = data.UploadID
 			savedETags = data.PartETags
-			fmt.Printf("Resuming multipart upload for %s: %s\n", f.relPath, savedUploadID)
+			log.Printf("Resuming multipart upload for %s: %s\n", f.relPath, savedUploadID)
 		}
 		output.Body.Close()
 	}
@@ -76,12 +78,14 @@ func (f *s3FileState) loadMultipartState() {
 	// Periksa apakah file sudah ada di S3 (source of truth).
 	alreadyOnS3 := false
 	if f.length > 0 {
-		res, err := f.t.s.client.HeadObject(context.TODO(), &s3.HeadObjectInput{
+		hctx, hcancel := s3ReadCtx()
+		res, err := f.t.s.client.HeadObject(hctx, &s3.HeadObjectInput{
 			Bucket: aws.String(f.t.s.Bucket),
 			Key:    aws.String(f.s3Key()),
 		})
+		hcancel()
 		if err == nil && *res.ContentLength == f.length {
-			fmt.Printf("File %s already on S3, skipping.\n", f.relPath)
+			log.Printf("File %s already on S3, skipping.\n", f.relPath)
 			alreadyOnS3 = true
 		}
 	}
@@ -89,10 +93,12 @@ func (f *s3FileState) loadMultipartState() {
 	// Buat multipart upload baru jika perlu.
 	var newUploadID string
 	if !alreadyOnS3 && f.length > 0 && savedUploadID == "" {
-		res, err := f.t.s.client.CreateMultipartUpload(context.TODO(), &s3.CreateMultipartUploadInput{
+		wctx, wcancel := s3WriteCtx()
+		res, err := f.t.s.client.CreateMultipartUpload(wctx, &s3.CreateMultipartUploadInput{
 			Bucket: aws.String(f.t.s.Bucket),
 			Key:    aws.String(f.s3Key()),
 		})
+		wcancel()
 		if err == nil {
 			newUploadID = *res.UploadId
 		}
@@ -123,13 +129,15 @@ func (f *s3FileState) loadMultipartState() {
 
 	// Upload file kosong ke S3.
 	if f.length == 0 {
-		_, err := f.t.s.client.PutObject(context.TODO(), &s3.PutObjectInput{
+		wctx, wcancel := s3WriteCtx()
+		_, err := f.t.s.client.PutObject(wctx, &s3.PutObjectInput{
 			Bucket: aws.String(f.t.s.Bucket),
 			Key:    aws.String(f.s3Key()),
 			Body:   strings.NewReader(""),
 		})
+		wcancel()
 		if err == nil {
-			fmt.Printf("[UPLOADED] %s | Empty file\n", f.relPath)
+			log.Printf("[UPLOADED] %s | Empty file\n", f.relPath)
 		}
 	}
 }
@@ -163,39 +171,49 @@ func (f *s3FileState) saveStateWith(uploadID string, partETags map[int]string) {
 		PartETags map[int]string
 	}{uploadID, partETags}
 	b, _ := json.Marshal(data)
-	_, _ = f.t.s.client.PutObject(context.TODO(), &s3.PutObjectInput{
+	ctx, cancel := s3WriteCtx()
+	defer cancel()
+	_, _ = f.t.s.client.PutObject(ctx, &s3.PutObjectInput{
 		Bucket: aws.String(f.t.s.Bucket),
 		Key:    aws.String(f.stateKey()),
 		Body:   strings.NewReader(string(b)),
 	})
 }
 
+// gcLocalChunks menghapus chunk lokal yang sudah diupload hingga di bawah localLimit.
+// O(n) single pass: kumpulkan kandidat hapus, update state di bawah lock, lalu hapus file di luar lock.
 func (f *s3FileState) gcLocalChunks() {
 	f.activeMu.Lock()
-	defer f.activeMu.Unlock()
 
-	for len(f.activeChunks) > f.localLimit {
-		removedIdx := -1
-		for i, idx := range f.activeChunks {
-			if f.partETags[idx+1] != "" {
-				removedIdx = i
-				break
-			}
+	excess := len(f.activeChunks) - f.localLimit
+	if excess <= 0 {
+		f.activeMu.Unlock()
+		return
+	}
+
+	var toRemove []int
+	var newActive []int
+	for _, idx := range f.activeChunks {
+		if excess > 0 && f.partETags[idx+1] != "" {
+			toRemove = append(toRemove, idx)
+			excess--
+		} else {
+			newActive = append(newActive, idx)
 		}
-		if removedIdx == -1 {
-			break
-		}
-		idx := f.activeChunks[removedIdx]
-		f.activeChunks = append(f.activeChunks[:removedIdx], f.activeChunks[removedIdx+1:]...)
+	}
+	f.activeChunks = newActive
+	f.activeMu.Unlock()
+
+	for _, idx := range toRemove {
 		removeFileAndEmptyParents(f.chunks[idx].localPath(), f.t.s.BaseDir)
-		fmt.Printf("GC: Local chunk %d of %s removed.\n", idx, f.relPath)
+		log.Printf("GC: Local chunk %d of %s removed.\n", idx, f.relPath)
 	}
 }
 
 // finalizeMultipart menyelesaikan multipart upload di S3.
 // Dipanggil di luar mutex.
 func (f *s3FileState) finalizeMultipart(uploadID string, partETags map[int]string) {
-	fmt.Printf("File %s fully uploaded! Finalizing multipart...\n", f.relPath)
+	log.Printf("File %s fully uploaded! Finalizing multipart...\n", f.relPath)
 	var parts []types.CompletedPart
 	for num, etag := range partETags {
 		parts = append(parts, types.CompletedPart{
@@ -206,16 +224,25 @@ func (f *s3FileState) finalizeMultipart(uploadID string, partETags map[int]strin
 	sort.Slice(parts, func(i, j int) bool {
 		return *parts[i].PartNumber < *parts[j].PartNumber
 	})
-	_, err := f.t.s.client.CompleteMultipartUpload(context.TODO(), &s3.CompleteMultipartUploadInput{
+	ctx, cancel := s3WriteCtx()
+	defer cancel()
+	_, err := f.t.s.client.CompleteMultipartUpload(ctx, &s3.CompleteMultipartUploadInput{
 		Bucket:          aws.String(f.t.s.Bucket),
 		Key:             aws.String(f.s3Key()),
 		UploadId:        aws.String(uploadID),
 		MultipartUpload: &types.CompletedMultipartUpload{Parts: parts},
 	})
 	if err == nil {
-		fmt.Printf("File %s completed in S3.\n", f.relPath)
+		log.Printf("File %s completed in S3.\n", f.relPath)
+		// Hapus state multipart — tidak lagi dibutuhkan.
+		if _, derr := f.t.s.client.DeleteObject(ctx, &s3.DeleteObjectInput{
+			Bucket: aws.String(f.t.s.Bucket),
+			Key:    aws.String(f.stateKey()),
+		}); derr != nil {
+			log.Printf("[WARN] cleanup state %s: %v\n", f.relPath, derr)
+		}
 	} else {
-		fmt.Printf("[FAILED] Finalizing %s: %v\n", f.relPath, err)
+		log.Printf("[FAILED] Finalizing %s: %v\n", f.relPath, err)
 	}
 }
 
@@ -270,17 +297,44 @@ func (c *s3Chunk) doUpload() {
 
 	path := c.localPath()
 
+	// Capture uploadID under lock before starting uploads to avoid reading it without lock.
+	c.state.activeMu.Lock()
+	uploadID := c.state.uploadID
+	c.state.activeMu.Unlock()
+
+	// Jika uploadID kosong (CreateMultipartUpload gagal saat startup), coba buat baru.
+	if uploadID == "" {
+		wctx, wcancel := s3WriteCtx()
+		res, cerr := c.state.t.s.client.CreateMultipartUpload(wctx, &s3.CreateMultipartUploadInput{
+			Bucket: aws.String(c.state.t.s.Bucket),
+			Key:    aws.String(c.state.s3Key()),
+		})
+		wcancel()
+		if cerr != nil {
+			log.Printf("[FAILED] %s | CreateMultipartUpload: %v\n", c.state.relPath, cerr)
+			c.state.activeMu.Lock()
+			c.uploading = false
+			c.state.activeMu.Unlock()
+			return
+		}
+		uploadID = *res.UploadId
+		c.state.activeMu.Lock()
+		c.state.uploadID = uploadID
+		c.state.activeMu.Unlock()
+		c.state.saveState()
+	}
+
 	// Upload dengan retry.
 	var (
 		etag string
 		err  error
 	)
 	for attempt := 0; attempt < maxUploadRetries; attempt++ {
-		etag, err = c.uploadOnce(path)
+		etag, err = c.uploadOnce(path, uploadID)
 		if err == nil {
 			break
 		}
-		fmt.Printf("[RETRY %d/%d] %s | Chunk %d: %v\n",
+		log.Printf("[RETRY %d/%d] %s | Chunk %d: %v\n",
 			attempt+1, maxUploadRetries, c.state.relPath, c.index+1, err)
 		if attempt < maxUploadRetries-1 {
 			time.Sleep(retryDelay(attempt))
@@ -292,7 +346,7 @@ func (c *s3Chunk) doUpload() {
 	c.uploading = false
 	if err != nil {
 		c.state.activeMu.Unlock()
-		fmt.Printf("[FAILED] %s | Chunk %d/%d: %v\n", c.state.relPath, c.index+1, len(c.state.chunks), err)
+		log.Printf("[FAILED] %s | Chunk %d/%d: %v\n", c.state.relPath, c.index+1, len(c.state.chunks), err)
 		return
 	}
 
@@ -305,7 +359,6 @@ func (c *s3Chunk) doUpload() {
 	}
 	shouldFinalize := len(c.state.partETags) == len(c.state.chunks)
 	// Salin data yang dibutuhkan untuk S3 calls di luar lock.
-	uploadID := c.state.uploadID
 	partETagsCopy := make(map[int]string, len(c.state.partETags))
 	for k, v := range c.state.partETags {
 		partETagsCopy[k] = v
@@ -313,7 +366,7 @@ func (c *s3Chunk) doUpload() {
 	c.state.activeMu.Unlock()
 
 	// S3 calls di luar lock — tidak memblokir operasi file lain.
-	fmt.Printf("[UPLOADED] %s | Chunk %d/%d\n", c.state.relPath, c.index+1, len(c.state.chunks))
+	log.Printf("[UPLOADED] %s | Chunk %d/%d\n", c.state.relPath, c.index+1, len(c.state.chunks))
 	c.state.saveStateWith(uploadID, partETagsCopy)
 	go c.uploadPieceMarkers()
 	if shouldFinalize {
@@ -324,18 +377,20 @@ func (c *s3Chunk) doUpload() {
 	c.state.gcLocalChunks()
 }
 
-func (c *s3Chunk) uploadOnce(path string) (etag string, err error) {
+func (c *s3Chunk) uploadOnce(path, uploadID string) (etag string, err error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return "", err
 	}
 	defer f.Close()
 
-	res, err := c.state.t.s.client.UploadPart(context.TODO(), &s3.UploadPartInput{
+	ctx, cancel := s3WriteCtx()
+	defer cancel()
+	res, err := c.state.t.s.client.UploadPart(ctx, &s3.UploadPartInput{
 		Bucket:     aws.String(c.state.t.s.Bucket),
 		Key:        aws.String(c.state.s3Key()),
 		PartNumber: aws.Int32(int32(c.index + 1)),
-		UploadId:   aws.String(c.state.uploadID),
+		UploadId:   aws.String(uploadID),
 		Body:       f,
 	})
 	if err != nil {
@@ -370,7 +425,7 @@ func removeFileAndEmptyParents(path, baseDir string) {
 		if err := os.Remove(curr); err != nil {
 			break // direktori tidak kosong atau tidak ada
 		}
-		fmt.Printf("GC: Removed empty directory: %s\n", curr)
+		log.Printf("GC: Removed empty directory: %s\n", curr)
 		curr = filepath.Dir(curr)
 	}
 }

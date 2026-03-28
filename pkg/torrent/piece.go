@@ -1,11 +1,12 @@
 package torrent
 
 import (
-	"context"
 	"encoding/hex"
 	"fmt"
+	"log"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/anacrolix/torrent/metainfo"
 	"github.com/anacrolix/torrent/storage"
@@ -39,14 +40,26 @@ func (pc *s3PieceCompletion) Set(pk metainfo.PieceKey, complete bool) error {
 func (pc *s3PieceCompletion) Close() error { return nil }
 
 // uploadMarker menyimpan marker di S3 untuk menandai piece sudah selesai.
+// Retry hingga maxUploadRetries kali jika gagal.
 func (pc *s3PieceCompletion) uploadMarker(index int) {
 	hash := hex.EncodeToString(pc.info.Pieces[index*20 : (index+1)*20])
 	key := fmt.Sprintf("%s/state/%s", pc.infoHash.HexString(), hash)
-	_, _ = pc.s.client.PutObject(context.TODO(), &s3.PutObjectInput{
-		Bucket: aws.String(pc.s.Bucket),
-		Key:    aws.String(key),
-		Body:   strings.NewReader(""),
-	})
+	for attempt := 0; attempt < maxUploadRetries; attempt++ {
+		ctx, cancel := s3WriteCtx()
+		_, err := pc.s.client.PutObject(ctx, &s3.PutObjectInput{
+			Bucket: aws.String(pc.s.Bucket),
+			Key:    aws.String(key),
+			Body:   strings.NewReader(""),
+		})
+		cancel()
+		if err == nil {
+			return
+		}
+		log.Printf("[WARN] uploadMarker piece %d attempt %d/%d: %v\n", index, attempt+1, maxUploadRetries, err)
+		if attempt < maxUploadRetries-1 {
+			time.Sleep(retryDelay(attempt))
+		}
+	}
 }
 
 // syncFromS3 memuat status completion piece dari S3 saat startup.
@@ -63,15 +76,19 @@ func (pc *s3PieceCompletion) syncFromS3() {
 
 	var continuationToken *string
 	for {
-		res, err := pc.s.client.ListObjectsV2(context.TODO(), &s3.ListObjectsV2Input{
+		ctx, cancel := s3ReadCtx()
+		res, err := pc.s.client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
 			Bucket:            aws.String(pc.s.Bucket),
 			Prefix:            aws.String(prefix),
 			ContinuationToken: continuationToken,
 		})
+		cancel()
 		if err != nil {
 			break
 		}
 
+		// Kumpulkan semua indices yang selesai, lalu batch update di bawah satu lock.
+		var toComplete []int
 		for _, obj := range res.Contents {
 			// Abaikan multipart state keys.
 			if strings.HasPrefix(*obj.Key, multipartPrefix) {
@@ -79,10 +96,15 @@ func (pc *s3PieceCompletion) syncFromS3() {
 			}
 			hash := strings.TrimPrefix(*obj.Key, prefix)
 			if idx, ok := pieceMap[hash]; ok {
-				pc.mu.Lock()
-				pc.cache[idx] = true
-				pc.mu.Unlock()
+				toComplete = append(toComplete, idx)
 			}
+		}
+		if len(toComplete) > 0 {
+			pc.mu.Lock()
+			for _, idx := range toComplete {
+				pc.cache[idx] = true
+			}
+			pc.mu.Unlock()
 		}
 
 		if !*res.IsTruncated || res.NextContinuationToken == nil {

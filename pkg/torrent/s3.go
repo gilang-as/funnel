@@ -3,7 +3,9 @@ package torrent
 import (
 	"context"
 	"fmt"
+	"log"
 	"sync"
+	"time"
 
 	"github.com/anacrolix/torrent/metainfo"
 	"github.com/anacrolix/torrent/storage"
@@ -18,6 +20,8 @@ const (
 	maxLocalChunks       = 2
 	maxConcurrentUploads = 4
 	maxUploadRetries     = 3
+	s3ReadTimeout        = 30 * time.Second
+	s3WriteTimeout       = 5 * time.Minute
 )
 
 // s3API adalah subset operasi S3 yang dipakai, memudahkan mocking di tests.
@@ -29,6 +33,7 @@ type s3API interface {
 	UploadPart(ctx context.Context, params *s3.UploadPartInput, optFns ...func(*s3.Options)) (*s3.UploadPartOutput, error)
 	CompleteMultipartUpload(ctx context.Context, params *s3.CompleteMultipartUploadInput, optFns ...func(*s3.Options)) (*s3.CompleteMultipartUploadOutput, error)
 	ListObjectsV2(ctx context.Context, params *s3.ListObjectsV2Input, optFns ...func(*s3.Options)) (*s3.ListObjectsV2Output, error)
+	DeleteObject(ctx context.Context, params *s3.DeleteObjectInput, optFns ...func(*s3.Options)) (*s3.DeleteObjectOutput, error)
 }
 
 // S3Storage adalah storage backend untuk anacrolix/torrent yang menyimpan
@@ -45,9 +50,6 @@ type S3Storage struct {
 
 	client    s3API
 	uploadSem chan struct{} // membatasi concurrent S3 uploads
-
-	mu             sync.Mutex
-	currentTorrent *s3Torrent
 }
 
 func NewS3Storage() *S3Storage {
@@ -63,10 +65,13 @@ func NewS3Storage() *S3Storage {
 		uploadSem:      make(chan struct{}, maxConcurrentUploads),
 	}
 
-	cfg, _ := config.LoadDefaultConfig(context.TODO(),
+	cfg, err := config.LoadDefaultConfig(context.Background(),
 		config.WithRegion(s.Region),
 		config.WithCredentialsProvider(credentials.NewStaticCredentialsProvider(s.AccessKey, s.SecretKey, "")),
 	)
+	if err != nil {
+		log.Fatalf("S3 config error: %v", err)
+	}
 	s.client = s3.NewFromConfig(cfg, func(o *s3.Options) {
 		o.BaseEndpoint = aws.String(s.Endpoint)
 		o.UsePathStyle = true
@@ -102,15 +107,11 @@ func (s *S3Storage) OpenTorrent(ctx context.Context, info *metainfo.Info, infoHa
 		}
 	}
 	if allDone {
-		fmt.Println("All files detected on S3. Forcing 100% completion status.")
+		log.Println("All files detected on S3. Forcing 100% completion status.")
 		for i := 0; i < info.NumPieces(); i++ {
 			t.pc.Set(metainfo.PieceKey{InfoHash: infoHash, Index: i}, true)
 		}
 	}
-
-	s.mu.Lock()
-	s.currentTorrent = t
-	s.mu.Unlock()
 
 	go t.saveMetainfo()
 
@@ -122,5 +123,14 @@ func (s *S3Storage) OpenTorrent(ctx context.Context, info *metainfo.Info, infoHa
 	}, nil
 }
 
-func (s *S3Storage) TriggerSync() {}
 func (s *S3Storage) Close() error { return nil }
+
+// s3ReadCtx returns a context with timeout for S3 read operations.
+func s3ReadCtx() (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.Background(), s3ReadTimeout)
+}
+
+// s3WriteCtx returns a context with timeout for S3 write/upload operations.
+func s3WriteCtx() (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.Background(), s3WriteTimeout)
+}

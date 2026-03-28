@@ -1,15 +1,29 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"log"
+	"os"
+	"os/signal"
+	"syscall"
 	"time"
 
 	"github.com/anacrolix/torrent"
 	ftorrent "github.com/gilang/funnel/pkg/torrent" // using our package
+	"golang.org/x/time/rate"
+)
+
+const (
+	// Batas upload (seed) dalam bytes/detik. 0 = unlimited.
+	// Contoh: 512*1024 = 512 KB/s, 1*1024*1024 = 1 MB/s
+	maxUploadBytesPerSec = 512 * 1024
 )
 
 func main() {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
 	// Hardcoded setup as requested
 	cfg := torrent.NewDefaultClientConfig()
 	// cfg.DataDir = "./data" // Disabled to keep metadata in S3 only
@@ -17,6 +31,12 @@ func main() {
 	// Use our custom S3 storage
 	s3Store := ftorrent.NewS3Storage()
 	cfg.DefaultStorage = s3Store
+
+	// Batasi bandwidth upload (seed) agar tidak rebutan dengan download.
+	if maxUploadBytesPerSec > 0 {
+		cfg.UploadRateLimiter = rate.NewLimiter(rate.Limit(maxUploadBytesPerSec), maxUploadBytesPerSec)
+		log.Printf("Upload rate limit: %s/s\n", formatBytes(maxUploadBytesPerSec))
+	}
 
 	client, err := torrent.NewClient(cfg)
 	if err != nil {
@@ -31,37 +51,39 @@ func main() {
 		log.Fatal(err)
 	}
 
-	<-t.GotInfo()
-	fmt.Printf("Seeding: %s\n", t.Name())
-	
-	// Trigger sync for files that might already be complete
-	s3Store.TriggerSync()
-	
+	select {
+	case <-t.GotInfo():
+	case <-ctx.Done():
+		log.Println("Interrupted before torrent info.")
+		return
+	}
+	log.Printf("Seeding: %s\n", t.Name())
+
 	t.DownloadAll()
 
 	// Keep running
-	fmt.Println("Seeding mode active...")
+	log.Println("Seeding mode active...")
 	lastPieces := -1
 	for {
 		stats := t.Stats()
 		piecesDone := stats.PiecesComplete
 		totalPieces := t.NumPieces()
-		
+
 		// Use t.BytesCompleted() instead of stats.BytesCompleted
 		bytesDone := t.BytesCompleted()
 		totalBytes := t.Length()
 		progress := float64(bytesDone) / float64(totalBytes) * 100
 
 		if piecesDone != lastPieces {
-			fmt.Printf("Progress: %.2f%% (Pieces: %d/%d, Bytes: %d/%d)\n",
+			log.Printf("Progress: %.2f%% (Pieces: %d/%d, Bytes: %d/%d)\n",
 				progress, piecesDone, totalPieces, bytesDone, totalBytes)
 			lastPieces = piecesDone
-			
+
 			if piecesDone < totalPieces {
 				// Find first missing piece index for debugging
 				for i := 0; i < totalPieces; i++ {
 					if !t.Piece(i).State().Complete {
-						fmt.Printf("   -> Piece %d is still marking as incomplete/verifying...\n", i)
+						log.Printf("   -> Piece %d is still marking as incomplete/verifying...\n", i)
 						break
 					}
 				}
@@ -69,13 +91,48 @@ func main() {
 		}
 
 		if piecesDone >= totalPieces || progress >= 99.9 {
-			fmt.Printf("Progress: 100.00%% (Final pieces verified or available on S3)\n")
-			fmt.Println("Success: All data is synced. Seeding mode only.")
+			log.Printf("Progress: 100.00%% (Final pieces verified or available on S3)\n")
+			log.Println("Success: All data is synced. Seeding mode only.")
 			break
 		}
-		time.Sleep(5 * time.Second)
+
+		select {
+		case <-ctx.Done():
+			log.Println("Interrupted, shutting down...")
+			return
+		case <-time.After(5 * time.Second):
+		}
 	}
 
-	// Just keep alive to seed from S3
-	select {}
+	// Seed dari S3 — log stats periodik
+	var lastUploaded int64
+	for {
+		select {
+		case <-ctx.Done():
+			log.Println("Shutting down gracefully...")
+			return
+		case <-time.After(10 * time.Second):
+			stats := t.Stats()
+			uploaded := stats.ConnStats.BytesWrittenData.Int64()
+			uploadRate := (uploaded - lastUploaded) / 10 // bytes/sec rata-rata 10 detik terakhir
+			lastUploaded = uploaded
+
+			log.Printf("[SEED] Peers: %d active / %d total | Uploaded: %s | Rate: %s/s\n",
+				stats.ActivePeers, stats.TotalPeers,
+				formatBytes(uploaded), formatBytes(uploadRate))
+		}
+	}
+}
+
+func formatBytes(b int64) string {
+	switch {
+	case b >= 1<<30:
+		return fmt.Sprintf("%.2f GB", float64(b)/(1<<30))
+	case b >= 1<<20:
+		return fmt.Sprintf("%.2f MB", float64(b)/(1<<20))
+	case b >= 1<<10:
+		return fmt.Sprintf("%.2f KB", float64(b)/(1<<10))
+	default:
+		return fmt.Sprintf("%d B", b)
+	}
 }

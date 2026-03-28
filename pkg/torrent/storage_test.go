@@ -110,6 +110,13 @@ func (m *mockS3) CompleteMultipartUpload(_ context.Context, params *s3.CompleteM
 	return &s3.CompleteMultipartUploadOutput{}, nil
 }
 
+func (m *mockS3) DeleteObject(_ context.Context, params *s3.DeleteObjectInput, _ ...func(*s3.Options)) (*s3.DeleteObjectOutput, error) {
+	m.mu.Lock()
+	delete(m.objects, *params.Key)
+	m.mu.Unlock()
+	return &s3.DeleteObjectOutput{}, nil
+}
+
 func (m *mockS3) ListObjectsV2(_ context.Context, params *s3.ListObjectsV2Input, _ ...func(*s3.Options)) (*s3.ListObjectsV2Output, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -650,6 +657,200 @@ func TestMarkComplete_SpanningTwoFiles(t *testing.T) {
 	case <-done:
 	case <-time.After(2 * time.Second):
 		t.Fatal("MarkComplete infinite loop atau terlalu lambat")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Tests: OpenTorrent — allDone detection
+// ---------------------------------------------------------------------------
+
+func TestOpenTorrent_AllDoneWhenFilesOnS3(t *testing.T) {
+	mock := newMockS3()
+	s := newTestStorage(t, mock)
+
+	pieceLen := int64(256 * 1024)
+	fileSize := int64(512 * 1024)
+	info := makeInfo("complete.flac", pieceLen, singleFile(fileSize))
+	var infoHash metainfo.Hash
+
+	// Simulasikan file sudah ada di S3 dengan ukuran yang tepat.
+	tor := newS3Torrent(s, info, infoHash)
+	state := tor.files[info.Name]
+	mock.mu.Lock()
+	mock.objects[state.s3Key()] = make([]byte, fileSize)
+	mock.mu.Unlock()
+
+	// OpenTorrent harus mendeteksi file sudah ada dan mark semua pieces complete.
+	impl, err := s.OpenTorrent(context.Background(), info, infoHash)
+	if err != nil {
+		t.Fatalf("OpenTorrent: %v", err)
+	}
+	defer impl.Close()
+
+	// Semua pieces harus complete.
+	for i := 0; i < info.NumPieces(); i++ {
+		piece := impl.Piece(info.Piece(i))
+		if !piece.Completion().Complete {
+			t.Errorf("piece %d seharusnya complete setelah allDone detection", i)
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Tests: readAbsolute — S3 fallback (seeding path)
+// ---------------------------------------------------------------------------
+
+func TestReadAbsolute_FallbackToS3(t *testing.T) {
+	mock := newMockS3()
+	s := newTestStorage(t, mock)
+
+	pieceLen := int64(256 * 1024) // 256KB
+	fileSize := int64(512 * 1024) // 512KB = 1 chunk
+	info := makeInfo("seed.flac", pieceLen, singleFile(fileSize))
+	var infoHash metainfo.Hash
+	tor := newS3Torrent(s, info, infoHash)
+
+	state := tor.files[info.Name]
+	setupMultipart(t, tor, mock)
+
+	// Siapkan data dan tulis ke S3 secara langsung (simulasi file sudah diupload).
+	data := make([]byte, fileSize)
+	for i := range data {
+		data[i] = byte(i % 251)
+	}
+	mock.mu.Lock()
+	mock.objects[state.s3Key()] = data
+	mock.mu.Unlock()
+
+	// Tandai semua piece complete dan partETags terisi (chunk sudah diupload).
+	for i := 0; i < info.NumPieces(); i++ {
+		tor.pc.Set(metainfo.PieceKey{InfoHash: infoHash, Index: i}, true)
+	}
+	state.activeMu.Lock()
+	state.partETags[1] = "etag-1" // chunk 0 = part 1
+	state.activeMu.Unlock()
+
+	// Tidak ada file lokal — harus fallback ke S3.
+	buf := make([]byte, fileSize)
+	n, err := tor.readAbsolute(buf, 0)
+	if err != nil {
+		t.Fatalf("readAbsolute: %v", err)
+	}
+	if n != int(fileSize) {
+		t.Fatalf("readAbsolute: got %d bytes, want %d", n, fileSize)
+	}
+	if string(buf) != string(data) {
+		t.Error("data dari S3 tidak cocok dengan data asli")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Tests: recovery uploadID kosong
+// ---------------------------------------------------------------------------
+
+func TestDoUpload_RecoversMissingUploadID(t *testing.T) {
+	orig := retryDelay
+	retryDelay = func(_ int) time.Duration { return time.Millisecond }
+	defer func() { retryDelay = orig }()
+
+	mock := newMockS3()
+	s := newTestStorage(t, mock)
+	info := makeInfo("test", 512*1024, singleFile(10*1024*1024))
+	var infoHash metainfo.Hash
+	tor := newS3Torrent(s, info, infoHash)
+
+	state := tor.files[info.Name]
+	// Simulasikan: uploadID kosong karena CreateMultipartUpload gagal saat startup.
+	state.activeMu.Lock()
+	state.uploadID = ""
+	state.partETags = make(map[int]string)
+	state.activeMu.Unlock()
+
+	chunk := state.chunks[0]
+	writeChunkToDisk(t, chunk)
+	markPiecesComplete(tor, chunk)
+
+	state.activeMu.Lock()
+	chunk.uploading = true
+	state.activeMu.Unlock()
+
+	done := make(chan struct{})
+	go func() {
+		chunk.doUpload()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("doUpload timeout")
+	}
+
+	state.activeMu.Lock()
+	etag := state.partETags[chunk.index+1]
+	uploadID := state.uploadID
+	state.activeMu.Unlock()
+
+	if etag == "" {
+		t.Error("chunk seharusnya berhasil diupload setelah recovery")
+	}
+	if uploadID == "" {
+		t.Error("uploadID seharusnya terisi setelah recovery CreateMultipartUpload")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Tests: stale state JSON dihapus setelah finalize
+// ---------------------------------------------------------------------------
+
+func TestFinalizeMultipart_DeletesStateKey(t *testing.T) {
+	orig := retryDelay
+	retryDelay = func(_ int) time.Duration { return time.Millisecond }
+	defer func() { retryDelay = orig }()
+
+	mock := newMockS3()
+	s := newTestStorage(t, mock)
+	s.MaxLocalChunks = 10
+
+	info := makeInfo("test", 256*1024, singleFile(10*1024*1024))
+	var infoHash metainfo.Hash
+	tor := newS3Torrent(s, info, infoHash)
+
+	state := tor.files[info.Name]
+	setupMultipart(t, tor, mock)
+
+	// Taruh state JSON palsu di mock untuk memastikan dihapus setelah upload selesai.
+	mock.mu.Lock()
+	mock.objects[state.stateKey()] = []byte(`{"UploadID":"uid","PartETags":{}}`)
+	mock.mu.Unlock()
+
+	// Upload semua chunk.
+	data := make([]byte, 10*1024*1024)
+	if _, err := tor.writeAbsolute(data, 0); err != nil {
+		t.Fatalf("writeAbsolute: %v", err)
+	}
+	for i := 0; i < info.NumPieces(); i++ {
+		piece := &s3Piece{t: tor, piece: info.Piece(i)}
+		piece.MarkComplete()
+	}
+
+	// Tunggu semua chunk selesai.
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		state.activeMu.Lock()
+		done := len(state.partETags) == len(state.chunks)
+		state.activeMu.Unlock()
+		if done {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	// State JSON harus sudah terhapus.
+	mock.mu.Lock()
+	_, exists := mock.objects[state.stateKey()]
+	mock.mu.Unlock()
+	if exists {
+		t.Error("state JSON seharusnya sudah terhapus setelah multipart selesai")
 	}
 }
 

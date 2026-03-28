@@ -1,14 +1,13 @@
 package torrent
 
 import (
-	"context"
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"path/filepath"
 	"strings"
-	"sync"
 
 	"github.com/anacrolix/torrent/metainfo"
 	"github.com/anacrolix/torrent/storage"
@@ -24,7 +23,7 @@ type s3Torrent struct {
 	files            map[string]*s3FileState
 	orderedFilePaths []string
 	fileOffsets      map[string]int64 // absolute offset tiap file di dalam torrent (precomputed)
-	mu               sync.Mutex
+	fileStarts       []int64          // sorted offsets, parallel to orderedFilePaths (for binary search)
 }
 
 func newS3Torrent(s *S3Storage, info *metainfo.Info, infoHash metainfo.Hash) *s3Torrent {
@@ -50,12 +49,14 @@ func newS3Torrent(s *S3Storage, info *metainfo.Info, infoHash metainfo.Hash) *s3
 		// Single-file torrent.
 		t.orderedFilePaths = append(t.orderedFilePaths, info.Name)
 		t.fileOffsets[info.Name] = 0
+		t.fileStarts = append(t.fileStarts, 0)
 		t.initFile(info.Name, info.Length)
 	} else {
 		for _, f := range info.Files {
 			path := filepath.Join(f.Path...)
 			t.orderedFilePaths = append(t.orderedFilePaths, path)
 			t.fileOffsets[path] = offset
+			t.fileStarts = append(t.fileStarts, offset)
 			t.initFile(path, f.Length)
 			offset += f.Length
 		}
@@ -65,7 +66,7 @@ func newS3Torrent(s *S3Storage, info *metainfo.Info, infoHash metainfo.Hash) *s3
 }
 
 func (t *s3Torrent) initFile(relPath string, length int64) {
-	fmt.Printf("[INIT] File: %s (Size: %d)\n", relPath, length)
+	log.Printf("[INIT] File: %s (Size: %d)\n", relPath, length)
 	chunkSize := t.s.ChunkSize
 	if chunkSize < defaultChunkSize {
 		chunkSize = defaultChunkSize
@@ -106,26 +107,48 @@ func (t *s3Torrent) initFile(relPath string, length int64) {
 }
 
 func (t *s3Torrent) saveMetainfo() {
-	data, _ := json.MarshalIndent(t.info, "", "  ")
+	data, err := json.MarshalIndent(t.info, "", "  ")
+	if err != nil {
+		log.Printf("[WARN] saveMetainfo marshal: %v\n", err)
+		return
+	}
 	key := fmt.Sprintf("%s/metainfo.json", t.infoHash.HexString())
-	_, _ = t.s.client.PutObject(context.TODO(), &s3.PutObjectInput{
+	ctx, cancel := s3WriteCtx()
+	defer cancel()
+	if _, err := t.s.client.PutObject(ctx, &s3.PutObjectInput{
 		Bucket: aws.String(t.s.Bucket),
 		Key:    aws.String(key),
 		Body:   strings.NewReader(string(data)),
-	})
+	}); err != nil {
+		log.Printf("[WARN] saveMetainfo upload: %v\n", err)
+	}
 }
 
 // findFile mencari file dan offset lokal dari absolute offset dalam torrent.
-// Kompleksitas O(n) — untuk torrent dengan banyak file, pertimbangkan binary search.
+// Menggunakan binary search O(log n).
 func (t *s3Torrent) findFile(absOff int64) (*s3FileState, int64, error) {
-	for _, path := range t.orderedFilePaths {
-		f := t.files[path]
-		fileStart := t.fileOffsets[path]
-		if absOff >= fileStart && absOff < fileStart+f.length {
-			return f, absOff - fileStart, nil
+	n := len(t.fileStarts)
+	// Binary search: find largest index i where fileStarts[i] <= absOff.
+	lo, hi := 0, n
+	for lo < hi {
+		mid := (lo + hi) / 2
+		if t.fileStarts[mid] <= absOff {
+			lo = mid + 1
+		} else {
+			hi = mid
 		}
 	}
-	return nil, 0, fmt.Errorf("offset %d out of range", absOff)
+	i := lo - 1
+	if i < 0 {
+		return nil, 0, fmt.Errorf("offset %d out of range", absOff)
+	}
+	path := t.orderedFilePaths[i]
+	f := t.files[path]
+	fileStart := t.fileStarts[i]
+	if absOff >= fileStart+f.length {
+		return nil, 0, fmt.Errorf("offset %d out of range", absOff)
+	}
+	return f, absOff - fileStart, nil
 }
 
 func (t *s3Torrent) readAbsolute(b []byte, absOff int64) (int, error) {
@@ -161,24 +184,39 @@ func (t *s3Torrent) readAbsolute(b []byte, absOff int64) (int, error) {
 		state.activeMu.Unlock()
 
 		if uploaded {
-			output, err := t.s.client.GetObject(context.TODO(), &s3.GetObjectInput{
-				Bucket: aws.String(t.s.Bucket),
-				Key:    aws.String(state.s3Key()),
-				Range:  aws.String(fmt.Sprintf("bytes=%d-%d", localOff, localOff+int64(canRead)-1)),
-			})
+			n, err := t.readChunkFromS3(state, localOff, readTarget)
 			if err == nil {
-				n, readErr := io.ReadFull(output.Body, readTarget)
-				output.Body.Close()
-				if readErr == nil || readErr == io.ErrUnexpectedEOF {
-					nTotal += n
-					continue
-				}
+				log.Printf("[S3→PEER] %s | chunk %d | %d bytes\n", state.relPath, chunkIdx, n)
+				nTotal += n
+				continue
 			}
 		}
 
 		return nTotal, fmt.Errorf("chunk %d not available locally or on S3 (file: %s)", chunkIdx, state.relPath)
 	}
 	return nTotal, nil
+}
+
+// readChunkFromS3 membaca data dari S3 menggunakan byte-range request.
+// context di-cancel setelah body selesai dibaca.
+func (t *s3Torrent) readChunkFromS3(state *s3FileState, localOff int64, dst []byte) (int, error) {
+	ctx, cancel := s3ReadCtx()
+	defer cancel()
+	end := localOff + int64(len(dst)) - 1
+	output, err := t.s.client.GetObject(ctx, &s3.GetObjectInput{
+		Bucket: aws.String(t.s.Bucket),
+		Key:    aws.String(state.s3Key()),
+		Range:  aws.String(fmt.Sprintf("bytes=%d-%d", localOff, end)),
+	})
+	if err != nil {
+		return 0, err
+	}
+	defer output.Body.Close()
+	n, readErr := io.ReadFull(output.Body, dst)
+	if readErr == nil || readErr == io.ErrUnexpectedEOF {
+		return n, nil
+	}
+	return n, readErr
 }
 
 func (t *s3Torrent) writeAbsolute(b []byte, absOff int64) (int, error) {
