@@ -13,13 +13,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - os: ubuntu-latest
-            test-flags: -race
-          - os: macos-latest
-            test-flags: -race
-          - os: windows-latest
-            test-flags: ""
+        os: [ubuntu-latest, macos-latest]
 
     steps:
       - uses: actions/checkout@v4
@@ -36,7 +30,26 @@ jobs:
         run: go vet ./...
 
       - name: Test
-        run: go test ${{ matrix.test-flags }} ./...
+        run: go test -race ./...
+
+  build-windows:
+    name: Build (cross-compile) / windows
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build for Windows
+        env:
+          GOOS: windows
+          GOARCH: amd64
+          CGO_ENABLED: "0"
+        run: go build ./...
 
   coverage:
     name: Coverage
